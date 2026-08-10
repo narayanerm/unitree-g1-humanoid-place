@@ -142,11 +142,11 @@ PLACE_YAW_RANGE       = 0.30
 # yaw range kept tight so the robot spawns facing the table.
 BOX_HOLD_X_OFFSET     = 0.32
 BOX_HOLD_Z_ABOVE_ROOT = 0.17
-# Robot pulled back to x=0.05 so the bent-knee thigh capsules stay behind the
-# table front edge (TABLE_X-0.34=0.26): ~21 cm pelvis-to-edge clearance.
-# Consequence: held box lands at x≈0.37, needs ~14 cm forward alignment to
-# reach PLACE_TARGET_X_CENTER=0.51 — small enough to count as "align, not walk".
-ROBOT_SPAWN_X_OFFSET  = 0.05
+# Pelvis pulled further back to x=-0.05 (user request) — thigh capsules sit
+# ~31 cm behind the table front edge (TABLE_X-0.34=0.26). Held box lands at
+# x≈0.27 (just over the front edge); needs ~24 cm forward alignment to reach
+# PLACE_TARGET_X_CENTER=0.51 — still a short approach, not a walk.
+ROBOT_SPAWN_X_OFFSET  = -0.05
 ROBOT_SPAWN_XY_JITTER = 0.03
 ROBOT_SPAWN_YAW_RANGE = (-0.20, 0.20)
 BOX_SPAWN_XY_JITTER   = 0.015
@@ -409,7 +409,12 @@ def reset_from_carry_buffer(
     default_root_state = robot.data.default_root_state[env_ids].clone()
     origins = env.scene.env_origins[env_ids]
 
-    root_xy = default_root_state[:, 0:2] + xy_jitter + origins[:, 0:2]
+    # Match the procedural reset_robot_and_box_held pose: push +X so the held
+    # box (at BOX_HOLD_X_OFFSET forward of the pelvis, in body-yaw frame) lands
+    # over PLACE_TARGET_X_CENTER on the tabletop. Without this the pelvis sits
+    # ~5 cm too far back and the box is short of the target.
+    spawn_offset = torch.tensor([ROBOT_SPAWN_X_OFFSET, 0.0], device=env.device)
+    root_xy = default_root_state[:, 0:2] + xy_jitter + origins[:, 0:2] + spawn_offset
     root_z_w = root_z + origins[:, 2:3]
     root_pos_w = torch.cat([root_xy, root_z_w], dim=-1)
     root_quat_w = quat_mul(q_yaw, quat_zy)
@@ -1966,8 +1971,13 @@ def build_g1_drop_mdp():
             mode="reset",
             params={
                 "buffer_path": CARRY_BUFFER_PATH,
-                "xy_range":  (-0.05, 0.05),
-                "yaw_range": (-math.pi, math.pi),
+                "xy_range":  (-ROBOT_SPAWN_XY_JITTER, ROBOT_SPAWN_XY_JITTER),
+                # Was (-pi, pi): the buffer stores the box in body-yaw frame,
+                # so sampling full 360° rotates robot+box together while the
+                # table stays fixed in world +X — half the episodes spawned
+                # the robot facing away from the table, making the drop task
+                # impossible on those seeds.
+                "yaw_range": ROBOT_SPAWN_YAW_RANGE,
                 "asset_cfg": g1_asset,
                 "box_cfg":   box,
             },

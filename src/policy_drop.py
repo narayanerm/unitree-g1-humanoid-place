@@ -108,6 +108,14 @@ G1_FOOT_GEOMS = tuple(
     f"{side}_foot{i}_collision" for side in ("left", "right") for i in range(1, 8)
 )
 
+# Walk-ready arm target: 14 arm joints at their walk reset values, aligned to
+# HOLDING_ARM_JOINTS order so arm_pose_walk_ready_reward can index either
+# ``arm_asset.joint_ids`` or ``HOLDING_ARM_JOINTS`` interchangeably. Mirror of
+# pick's HOLDING_ARM_TARGET but pulling toward the walk start pose instead of
+# the carry hug — used to shape the drop's terminal snapshot for a clean
+# hand-off back into the walk policy.
+WALK_READY_ARM_TARGET = tuple(G1_HOME_JOINT_POS[j] for j in HOLDING_ARM_JOINTS)
+
 
 # Scene and target geometry.
 TABLE_X          = 0.60
@@ -1127,6 +1135,43 @@ def hand_release_reward(env, box_cfg, left_hand_cfg, right_hand_cfg,
     return landed * away
 
 
+def arm_pose_walk_ready_reward(
+    env, box_cfg, left_hand_cfg, right_hand_cfg, arm_cfg,
+    target_values: tuple[float, ...] = WALK_READY_ARM_TARGET,
+    sigma: float = 0.30,
+    air_margin: float = 0.03,
+    release_dist: float = 0.15,
+):
+    """Shape the terminal arm pose toward G1_HOME_JOINT_POS (walk-ready).
+
+    Mirror of pick's arm_pose_carry_ready but pulling toward the walk start
+    pose instead of the carry hug: Gaussian on the mean per-joint distance
+    from the 14 arm joints to WALK_READY_ARM_TARGET, gated on (box landed on
+    the tabletop) AND (both hands moved away from the grasp anchors). The
+    double gate keeps the term silent during descent — it only fires once the
+    box is placed and released, so it shapes the terminal posture without
+    distorting the drop trajectory.
+    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities for the release gate; arm_cfg — SceneEntityCfg selecting the 14 arm joints in HOLDING_ARM_JOINTS order; target_values — per-joint targets aligned with arm_cfg.joint_ids; sigma — Gaussian bandwidth (rad) on the RMS joint error; air_margin — clearance above BOX_REST_Z below which the box counts as landed; release_dist — min hand-to-anchor distance for the release gate.
+    Returns: (num_envs,) tensor in [0, 1].
+    """
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    landed = (box_z < BOX_REST_Z + air_margin)
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    released = (dl > release_dist) & (dr > release_dist)
+    gate = (landed & released).float()
+
+    robot = env.scene["robot"]
+    joints = robot.data.joint_pos[:, arm_cfg.joint_ids]
+    if not hasattr(env, "_walk_ready_arm_target_cache"):
+        env._walk_ready_arm_target_cache = torch.tensor(
+            target_values, device=env.device, dtype=joints.dtype,
+        )
+    err = joints - env._walk_ready_arm_target_cache
+    mean_sq_err = (err * err).mean(dim=-1)
+    return gate * torch.exp(-mean_sq_err / (2.0 * sigma * sigma))
+
+
 def hands_on_anchor_reward(env, box_cfg, left_hand_cfg, right_hand_cfg,
                             near_dist: float = 0.05,
                             kernel_std: float = 0.05):
@@ -1645,11 +1690,14 @@ def drop_curriculum(env, env_ids):
     Returns: dict with current drop_scale for logging.
     """
     step = int(getattr(env, "common_step_counter", 0))
-    if step < 2_000_000:
+    # Schedule anchored to PPO iters (num_steps_per_env=24) for a 4000-iter budget:
+    # iter 250 = 6k, iter 1500 = 36k. Warmup 6%, linear ramp 6-38%, full 38%+.
+    if step < 6_000:                       # iter 0-250: warmup at scale=0.30
         scale = 0.30
-    elif step < 6_000_000:
-        scale = 0.65
-    else:
+    elif step < 36_000:                    # iter 250-1500: linear ramp 0.30 -> 1.00
+        t = (step - 6_000) / (36_000 - 6_000)
+        scale = 0.30 + 0.70 * t
+    else:                                  # iter 1500+: full curriculum
         scale = 1.00
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_drop_cmd")
@@ -1680,6 +1728,7 @@ def build_g1_drop_mdp():
     )
 
     g1_asset      = SceneEntityCfg("robot", joint_names=G1_JOINTS, preserve_order=True)
+    arm_asset     = SceneEntityCfg("robot", joint_names=HOLDING_ARM_JOINTS, preserve_order=True)
     left_sym      = SceneEntityCfg("robot", joint_names=_LEFT_SYM_JOINTS,  preserve_order=True)
     right_sym     = SceneEntityCfg("robot", joint_names=_RIGHT_SYM_JOINTS, preserve_order=True)
     wrist_acts    = SceneEntityCfg("robot", actuator_names=(r".*wrist.*",), preserve_order=True)
@@ -1855,6 +1904,15 @@ def build_g1_drop_mdp():
                                                           "sigma_xy": 0.30,
                                                           "sigma_z_above": 0.30,
                                                           "sigma_z_below": 0.05}),
+        # Ungated dense pull toward the place target: the gated term above zeros
+        # out until stability + hand-placement gates open, which the 2026-08-10
+        # run showed never happened — the policy converged to "hold forever" for
+        # lack of a continuous placement gradient. This term always fires.
+        "box_at_place_target_pos_ungated": RewardTermCfg(
+            func=box_at_place_target_pos_reward, weight=2.0,
+            params={"box_cfg": box,
+                    "sigma_xy": 0.30, "sigma_z_above": 0.30, "sigma_z_below": 0.05},
+        ),
         # Fused: box_upright + box_front_aligned + box_at_chest → box_carry_pose_bundle (w=1.5 each folded in).
         "box_carry_pose": RewardTermCfg(
             func=box_carry_pose_bundle_reward, weight=1.0,
@@ -1897,6 +1955,17 @@ def build_g1_drop_mdp():
                     "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "release_dist": 0.15, "air_margin": 0.03},
         ),
+        # Shapes the terminal arm posture toward G1_HOME_JOINT_POS (walk-ready)
+        # so the drop's terminal snapshot feeds cleanly into the walk policy.
+        # Mirror of pick's arm_pose_carry_ready: double-gated on (box landed)
+        # AND (both hands released), so it stays silent during descent.
+        "arm_pose_walk_ready": RewardTermCfg(
+            func=arm_pose_walk_ready_reward, weight=1.5,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "arm_cfg": arm_asset,
+                    "target_values": WALK_READY_ARM_TARGET,
+                    "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
+        ),
         # Fused: free_fall_penalty + hand_lost_grip_penalty + box_jammed_penalty
         # → box_unsupported_bundle. All 3 read (dl, dr, box_z, box_vz); shared here.
         # (box_jammed_penalty was later in the list; its registration is also removed.)
@@ -1934,8 +2003,8 @@ def build_g1_drop_mdp():
         # "release early, let box fly to target" exploit that the hand-only
         # velocity penalty misses.
         "box_impact_vel": RewardTermCfg(
-            func=box_impact_velocity_penalty, weight=-5.0,
-            params={"box_cfg": box, "gate_z": 0.10},
+            func=box_impact_velocity_penalty, weight=-1.5,
+            params={"box_cfg": box, "gate_z": 0.05},
         ),
         "hand_approach_vel": RewardTermCfg(
             func=hand_approach_velocity_penalty, weight=-3.0,
@@ -2170,12 +2239,12 @@ def g1_drop_ppo_runner_cfg():
             hidden_dims=(512, 256, 128),
             activation="elu",
             obs_normalization=True,
-            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.45, "std_type": "scalar"},
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.30, "std_type": "scalar"},
         ),
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfg(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
-            entropy_coef=0.003,
+            entropy_coef=0.001,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
             gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
         ),

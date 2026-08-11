@@ -983,12 +983,13 @@ def box_at_place_target_pos_reward(
 def descent_progress_reward(
     env, box_cfg, left_hand_cfg, right_hand_cfg,
     hold_dist: float = 0.10,
+    xy_gate_dist: float = 0.15,
 ):
-    """Linear reward for descent progress toward the target, gated on both hands being close to their commanded grasp anchors.
-    Args: env — RL env; box_cfg — box entity; left_hand_cfg — left hand entity; right_hand_cfg — right hand entity; hold_dist — max hand-to-anchor distance for the gate.
+    """Linear reward for descent progress toward the target, gated on both hands being close to their commanded grasp anchors AND the box being over the place-target xy.
+    Args: env — RL env; box_cfg — box entity; left_hand_cfg — left hand entity; right_hand_cfg — right hand entity; hold_dist — max hand-to-anchor distance for the holding gate; xy_gate_dist — max box-to-target xy distance for the "over target" gate.
     Returns: (num_envs,) tensor in [0, 1].
     """
-    # Gate uses distance to the grasp anchor, not to box centre: the anchor lives on the box side face ~13 cm from the centre, so a centre-distance gate with hold_dist=0.10 never fires (2026-07-25 run had descent_progress=0 from exactly this bug).
+    # Gate uses distance to the grasp anchor, not to box centre: the anchor lives on the box side face ~13 cm from the centre, so a centre-distance gate with hold_dist=0.10 never fires (2026-07-25 run had descent_progress=0 from exactly this bug). xy_gate added 2026-08-11 to stop the "lower straight down beside body" farm — descent only pays when the box is over the tabletop.
     _ensure_cmd_buffers(env)
     box = _entity_pos(env, box_cfg)
     tgt = env.extras[_CMD_KEY + "place_target_pos"]
@@ -997,7 +998,9 @@ def descent_progress_reward(
     dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
     dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
     holding = ((dl < hold_dist) & (dr < hold_dist)).float()
-    return descent * holding
+    xy_dist = torch.linalg.norm(box[:, :2] - tgt[:, :2], dim=-1)
+    over_target = (xy_dist < xy_gate_dist).float()
+    return descent * holding * over_target
 
 
 def release_shoulder_open_reward(
@@ -1405,6 +1408,17 @@ def upright_torso_reward(env, trunk_cfg):
     return torch.clamp(up_z, 0.0, 1.0)
 
 
+def torso_pitch_penalty(env, trunk_cfg):
+    """Squared penalty on trunk forward/back tilt, from the +x component of projected gravity in the base frame.
+    The upright_torso_reward uses only up_z (which is symmetric to pitch and stays ~0.94 at 20°), so a robot balancing a 3 kg box out front can lean the trunk back with almost no reward cost. This term breaks that: it is 0 when vertical and grows as |sin(pitch)|², independent of roll.
+    Args: env — the RL env; trunk_cfg — trunk entity.
+    Returns: (num_envs,) tensor >= 0.
+    """
+    entity: Entity = env.scene[trunk_cfg.name]
+    gx = entity.data.projected_gravity_b[:, 0]
+    return gx * gx
+
+
 def symmetric_pose_penalty(env, left_cfg, right_cfg):
     """Sum of squared mirrored-joint deviations across arm/wrist pairs.
     Args: env — the RL env; left_cfg — left joint set entity; right_cfg — right joint set entity.
@@ -1465,13 +1479,14 @@ def gated_box_at_place_target_quat_reward(env, box_cfg, trunk_cfg, sensor_name):
 def gated_descent_progress_reward(
     env, box_cfg, left_hand_cfg, right_hand_cfg,
     trunk_cfg, sensor_name, hold_dist: float = 0.10,
+    xy_gate_dist: float = 0.15,
 ):
     """Multiply descent_progress_reward by stability_gate so descent credit only accrues when the robot is upright and grounded.
-    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities; trunk_cfg — trunk entity; sensor_name — feet sensor; hold_dist — max hand-to-anchor distance for the descent gate.
+    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities; trunk_cfg — trunk entity; sensor_name — feet sensor; hold_dist — max hand-to-anchor distance for the descent gate; xy_gate_dist — max box-to-target xy distance for the "over target" gate.
     Returns: (num_envs,) tensor in [0, 1].
     """
     return descent_progress_reward(
-        env, box_cfg, left_hand_cfg, right_hand_cfg, hold_dist,
+        env, box_cfg, left_hand_cfg, right_hand_cfg, hold_dist, xy_gate_dist,
     ) * stability_gate(env, trunk_cfg, sensor_name)
 
 
@@ -1829,12 +1844,16 @@ def build_g1_drop_mdp():
         # the base broad-above/narrow-below Gaussian is computed once per step.
         "box_at_place_target_pos": RewardTermCfg(
             func=box_at_place_target_pos_fused_reward, weight=1.0,
+            # sigma_xy tightened 0.30 -> 0.12 and w_ungated raised 2 -> 4 on
+            # 2026-08-11: the broad kernel + weak weight left a shallow xy
+            # gradient, so lowering the box straight down beside the body still
+            # paid ~0.6 of the placement reward with no incentive to reach out.
             params={"box_cfg": box, "trunk_cfg": trunk,
                     "sensor_name": "feet_ground_contact",
                     "hand_box_sensor_name": "hand_box_contact",
                     "hand_force_threshold": 1.0, "air_margin": 0.03,
-                    "sigma_xy": 0.30, "sigma_z_above": 0.30, "sigma_z_below": 0.05,
-                    "w_ungated": 2.0, "w_gated": 4.0},
+                    "sigma_xy": 0.12, "sigma_z_above": 0.30, "sigma_z_below": 0.05,
+                    "w_ungated": 4.0, "w_gated": 4.0},
         ),
         # Fused box_upright + box_front_aligned + box_at_chest into box_carry_pose_bundle (w=1.5 each folded in).
         "box_carry_pose": RewardTermCfg(
@@ -1844,14 +1863,17 @@ def build_g1_drop_mdp():
             # chest pull so the policy sees no reward penalty for lowering the box.
             params={"box_cfg": box, "w_upright": 1.5, "w_front": 1.5, "w_chest": 0.0},
         ),
-        # Dense linear signal for every centimetre of descent, gated on holding.
+        # Dense linear signal for every centimetre of descent, gated on holding
+        # AND on box xy being over the place target — without the xy gate the
+        # policy farms descent by lowering the box straight down beside the body.
         "descent_progress": RewardTermCfg(func=gated_descent_progress_reward, weight=3.0,
                                           params={"box_cfg": box,
                                                   "left_hand_cfg": left_hand,
                                                   "right_hand_cfg": right_hand,
                                                   "trunk_cfg": trunk,
                                                   "sensor_name": "feet_ground_contact",
-                                                  "hold_dist": 0.10}),
+                                                  "hold_dist": 0.10,
+                                                  "xy_gate_dist": 0.15}),
         # Explicit "flat" bonus near the target — up_z^4 punishes any residual tilt.
         "box_flat_at_target": RewardTermCfg(func=gated_box_flat_at_target_reward, weight=5.0,
                                             params={"box_cfg": box, "trunk_cfg": trunk,
@@ -1903,6 +1925,14 @@ def build_g1_drop_mdp():
             params={"trunk_cfg": trunk, "pelvis_cfg": pelvis,
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
+        ),
+        # upright_torso_reward is symmetric in pitch (up_z stays ~0.94 at 20 deg),
+        # so the policy learned to lean the trunk back to balance a heavy held
+        # box for free. Penalise forward/back tilt directly via +x of projected
+        # gravity in the base frame — 0 when vertical, grows as |sin(pitch)|^2.
+        "torso_pitch": RewardTermCfg(
+            func=torso_pitch_penalty, weight=-0.5,
+            params={"trunk_cfg": trunk},
         ),
         # Fused walk_to_place_target + walk_to_place_progress into walk_to_target_bundle (w=2.0 + w=1.0 folded in) sharing the horizontal delta vector.
         "walk_to_target": RewardTermCfg(

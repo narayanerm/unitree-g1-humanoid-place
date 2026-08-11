@@ -844,18 +844,22 @@ def hand_placement_gate(env, box_cfg,
     return torch.where(box_on_table, ~hand_touching, hand_touching).float()
 
 
-def box_impact_velocity_penalty(env, box_cfg, gate_z: float = 0.10):
-    """Penalise the box's speed squared as it approaches the tabletop, ramped in over the last gate_z metres.
-    Args: env — RL env; box_cfg — box entity; gate_z — height above BOX_REST_Z where the ramp begins.
+def box_impact_velocity_penalty(env, box_cfg, gate_z: float = 0.10,
+                                 w_lin: float = 1.0, w_ang: float = 0.0):
+    """Penalise the box's linear and angular speed squared as it approaches the tabletop, ramped in over the last gate_z metres.
+    Physical intuition: the only way for the box to have low speed near the tabletop is for the hands to accompany it — so this term alone shapes a controlled descent without touching any release gate. w_ang catches the "flick-and-let-go" pattern where the arms impart a spin on release.
+    Args: env — RL env; box_cfg — box entity; gate_z — height above BOX_REST_Z where the ramp begins; w_lin — weight on ‖v_box‖²; w_ang — weight on ‖ω_box‖².
     Returns: (num_envs,) tensor.
     """
     box = env.scene[box_cfg.name]
     box_z = box.data.root_link_pos_w[:, 2]
     box_v = box.data.root_link_lin_vel_w
+    box_w = box.data.root_link_ang_vel_w
     height_above_rest = box_z - BOX_REST_Z
     gate = torch.clamp(1.0 - height_above_rest / gate_z, min=0.0, max=1.0)
-    speed_sq = (box_v ** 2).sum(dim=-1)
-    return gate * speed_sq
+    lin_sq = (box_v ** 2).sum(dim=-1)
+    ang_sq = (box_w ** 2).sum(dim=-1)
+    return gate * (w_lin * lin_sq + w_ang * ang_sq)
 
 
 def stay_still_penalty(
@@ -1420,9 +1424,12 @@ def box_jammed_penalty(env, box_cfg, left_hand_cfg, right_hand_cfg,
 
 
 def walk_to_target_bundle_reward(env, sigma: float = 1.0,
-                                  w_target: float = 2.0, w_progress: float = 1.0):
-    """Fused walk_to_place_target (Gaussian on distance) and walk_to_place_progress (velocity along target direction) sharing the horizontal delta vector.
-    Args: env — RL env; sigma — Gaussian bandwidth for the distance term; w_target/w_progress — per-signal weights folded in.
+                                  w_target: float = 2.0, w_progress: float = 1.0,
+                                  box_cfg: SceneEntityCfg | None = None,
+                                  air_margin: float = 0.03,
+                                  air_ramp: float = 0.05):
+    """Fused walk_to_place_target (Gaussian on distance) and walk_to_place_progress (velocity along target direction) sharing the horizontal delta vector. Multiplied by the same airborne ramp as hand_placement so that once the box lands the approach reward zeroes — otherwise the policy is paid for stepping forward after release, producing the "one extra step until it bumps the table" behaviour.
+    Args: env — RL env; sigma — Gaussian bandwidth for the distance term; w_target/w_progress — per-signal weights folded in; box_cfg — box entity (enables the airborne gate; omit to keep the pre-2026-08-11 always-on behaviour); air_margin — clearance above BOX_REST_Z at which the gate reaches zero; air_ramp — vertical span over which the gate ramps back to one.
     Returns: (num_envs,) tensor.
     """
     _ensure_cmd_buffers(env)
@@ -1437,7 +1444,12 @@ def walk_to_target_bundle_reward(env, sigma: float = 1.0,
     lin_vel_w = robot.data.root_link_lin_vel_w[:, :2]
     v_align = torch.sum(direction * lin_vel_w, dim=-1)
     progress_r = torch.clamp(v_align, -1.5, 1.5)
-    return w_target * target_r + w_progress * progress_r
+    bundle = w_target * target_r + w_progress * progress_r
+    if box_cfg is None:
+        return bundle
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    airborne = torch.clamp((box_z - (BOX_REST_Z + air_margin)) / air_ramp, 0.0, 1.0)
+    return bundle * airborne
 
 
 def walk_to_place_target_reward(env, sigma: float = 1.0):
@@ -2060,10 +2072,16 @@ def build_g1_drop_mdp():
             func=torso_pitch_penalty, weight=-5.0,
             params={"trunk_cfg": trunk},
         ),
-        # Fused walk_to_place_target + walk_to_place_progress into walk_to_target_bundle (w=2.0 + w=1.0 folded in) sharing the horizontal delta vector.
+        # Fused walk_to_place_target + walk_to_place_progress into walk_to_target_bundle
+        # (w=2.0 + w=1.0 folded in) sharing the horizontal delta vector. Airborne-gated
+        # via box_cfg on 2026-08-11: keeping the approach signal on after landing
+        # taught the policy to take one extra step forward until it grazed the
+        # tabletop with the robot body; multiplying by the same airborne ramp as
+        # hand_placement zeroes the reward the moment the box is down.
         "walk_to_target": RewardTermCfg(
             func=walk_to_target_bundle_reward, weight=1.0,
-            params={"sigma": 1.0, "w_target": 2.0, "w_progress": 1.0},
+            params={"sigma": 1.0, "w_target": 2.0, "w_progress": 1.0,
+                    "box_cfg": box, "air_margin": 0.03, "air_ramp": 0.05},
         ),
         # stay_still removed: its gate (hands-near-anchors) is always open while
         # holding the box, so the -0.5 * |v|^2 penalty was applied to every attempt
@@ -2074,10 +2092,15 @@ def build_g1_drop_mdp():
         "action_rate_l2":   RewardTermCfg(func=action_rate_l2,     weight=-1.0e-2),
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2, weight=-1.0e-2),
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,          weight=-1.0e-3),
-        # Punish box kinetic energy near the tabletop — kills the "release early, let box fly to target" exploit that the hand-only velocity penalty misses.
+        # Punish box kinetic energy on the entire descent — widened from the
+        # previous 5 cm gate + w=-1.5 (which was inert against the +15 hand_release
+        # cliff and let the policy "toss and pull hand away" as soon as the box
+        # was near the top). gate_z 0.05 -> 0.35 turns this into a dense
+        # descent-long gradient starting at ~chest height; w_ang added to catch
+        # the flick-of-the-wrist that comes with an early release.
         "box_impact_vel": RewardTermCfg(
-            func=box_impact_velocity_penalty, weight=-1.5,
-            params={"box_cfg": box, "gate_z": 0.05},
+            func=box_impact_velocity_penalty, weight=-6.0,
+            params={"box_cfg": box, "gate_z": 0.35, "w_lin": 1.0, "w_ang": 0.1},
         ),
         "hand_approach_vel": RewardTermCfg(
             func=hand_approach_velocity_penalty, weight=-3.0,

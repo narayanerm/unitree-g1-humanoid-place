@@ -1930,8 +1930,12 @@ def build_g1_drop_mdp():
         # so the policy learned to lean the trunk back to balance a heavy held
         # box for free. Penalise forward/back tilt directly via +x of projected
         # gravity in the base frame — 0 when vertical, grows as |sin(pitch)|^2.
+        # Weight bumped -0.5 -> -5.0 on 2026-08-11 after the -0.5 run still
+        # converged to a 20 deg back-lean: at that tilt the penalty was
+        # -0.058/step, drowned by the +23/step hand_placement attractor. -5.0
+        # gives -0.58/step, comparable to the other shaping terms.
         "torso_pitch": RewardTermCfg(
-            func=torso_pitch_penalty, weight=-0.5,
+            func=torso_pitch_penalty, weight=-5.0,
             params={"trunk_cfg": trunk},
         ),
         # Fused walk_to_place_target + walk_to_place_progress into walk_to_target_bundle (w=2.0 + w=1.0 folded in) sharing the horizontal delta vector.
@@ -1964,13 +1968,13 @@ def build_g1_drop_mdp():
             func=vel_mdp.self_collision_cost, weight=-1.0,
             params={"sensor_name": self_collision_cfg.name, "force_threshold": 10.0},
         ),
-        # Fused non_hand_box + body_table into body_collision_bundle (w=-2.0 each folded in).
+        # Fused non_hand_box + body_table into body_collision_bundle. w_non_hand_box bumped -2.0 -> -6.0 on 2026-08-11: the shallow ramp (-2.0 across a 22 cm activation) topped out at ~-1.1/step even with the box resting on the torso, so the policy had no gradient pushing the body away from the box before the termination fired.
         "body_collision": RewardTermCfg(
             func=body_collision_bundle_penalty, weight=1.0,
             params={"trunk_cfg": trunk, "left_shank_cfg": left_shank, "right_shank_cfg": right_shank,
                     "left_hip_cfg": left_hip, "right_hip_cfg": right_hip,
                     "left_hand_cfg": left_hand, "right_hand_cfg": right_hand, "box_cfg": box,
-                    "w_non_hand_box": -2.0, "w_body_table": -2.0},
+                    "w_non_hand_box": -6.0, "w_body_table": -2.0},
         ),
     }
 
@@ -2057,11 +2061,11 @@ def build_g1_drop_mdp():
             params={"sensor_name": body_table_contact_cfg.name,
                     "force_threshold": 5.0},
         ),
-        # Kill the "let box collapse into the lap / rest legs on the box" attractor via physics contact between torso/hip/knee/ankle geoms and the box. Replaces the previous pair (geometric box_touched_body + sensor-based body_touched_box) — the sensor covers a strict superset of the geometric check (torso + all hip axes + knee + ankle_pitch) with actual contact forces, so the distance test was redundant.
+        # Kill the "let box collapse into the lap / rest legs on the box" attractor via physics contact between torso/hip/knee/ankle geoms and the box. Replaces the previous pair (geometric box_touched_body + sensor-based body_touched_box) — the sensor covers a strict superset of the geometric check (torso + all hip axes + knee + ankle_pitch) with actual contact forces, so the distance test was redundant. Threshold dropped 5.0 -> 1.0 on 2026-08-11 after the trained policy learned to rest the box lightly against torso/thigh (~2-3 N) to stay below the old cutoff and farm hand_placement.
         "body_touched_box": TerminationTermCfg(
             func=body_touched_box,
             params={"sensor_name": body_box_contact_cfg.name,
-                    "force_threshold": 5.0},
+                    "force_threshold": 1.0},
         ),
         # Kill the "release mid-air, let it fall onto the target" attractor: end the episode if wrist-vs-box contact drops out while the box centre is still > 3 cm above its rest height.
         "box_released_airborne": TerminationTermCfg(

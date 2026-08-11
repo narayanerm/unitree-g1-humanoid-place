@@ -825,9 +825,10 @@ def dof_torque_l2(env):
 def grip_force_reward(env, sensor_name: str = "hand_box_contact",
                       target_force: float = 5.0,
                       box_cfg: SceneEntityCfg | None = None,
-                      air_margin: float = 0.03):
-    """Reward positive normal force between robot and box, saturating at target_force and zeroed once the box has landed.
-    Args: env — RL env; sensor_name — ContactSensor name; target_force — N at which reward saturates; box_cfg — box entity (enables the airborne gate); air_margin — how close the box centre must be to BOX_REST_Z to count as landed.
+                      air_margin: float = 0.03,
+                      air_ramp: float = 0.05):
+    """Reward positive normal force between robot and box, saturating at target_force and smoothly decayed as the box approaches the tabletop.
+    Args: env — RL env; sensor_name — ContactSensor name; target_force — N at which reward saturates; box_cfg — box entity (enables the airborne ramp); air_margin — clearance above BOX_REST_Z at which grip_force fully zeros; air_ramp — vertical span over which grip_force ramps from full to zero.
     Returns: (num_envs,) tensor in [0, 1].
     """
     sensor = env.scene[sensor_name]
@@ -840,7 +841,13 @@ def grip_force_reward(env, sensor_name: str = "hand_box_contact",
     if box_cfg is None:
         return base
     box_z = _entity_pos(env, box_cfg)[:, 2]
-    airborne = (box_z >= BOX_REST_Z + air_margin).float()
+    # Smooth ramp instead of a hard step at BOX_REST_Z + air_margin: the previous
+    # cliff created a "safe hover" zone at box_z ~ 0.70 m where grip_force paid full
+    # 8/step, and landing wiped it out in a single tick. Ramp fades from 1 at
+    # box_z >= BOX_REST_Z + air_margin + air_ramp down to 0 at BOX_REST_Z + air_margin.
+    airborne = torch.clamp(
+        (box_z - (BOX_REST_Z + air_margin)) / air_ramp, 0.0, 1.0
+    )
     return base * airborne
 
 
@@ -1098,6 +1105,23 @@ def arm_pose_walk_ready_reward(
     return gate * torch.exp(-mean_sq_err / (2.0 * sigma * sigma))
 
 
+def box_landed_flat_bonus(env, box_cfg,
+                           air_margin: float = 0.03,
+                           up_threshold: float = 0.95):
+    """Small step-wise reward while the box is landed AND flat, independent of hand state.
+    Fires whenever ``box_z <= BOX_REST_Z + air_margin`` and ``up_z > up_threshold``, with no gate on hand contact or release distance. Purpose: let the policy "prove" a landing and see a positive gradient without also having to release simultaneously — the 2026-08-10 run showed the fully-gated landing rewards (box_flat_at_target, gated box_at_place_target_pos) never fired because reaching them required coordinating land + release + flat in one step.
+    Args: env — RL env; box_cfg — box entity; air_margin — clearance above BOX_REST_Z below which the box counts as landed; up_threshold — box up_z above which it counts as flat.
+    Returns: (num_envs,) tensor in {0, 1}.
+    """
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    landed = (box_z < BOX_REST_Z + air_margin).float()
+    box_quat = env.scene[box_cfg.name].data.root_link_quat_w
+    x, y = box_quat[:, 1], box_quat[:, 2]
+    up_z = torch.clamp(1.0 - 2.0 * (x * x + y * y), 0.0, 1.0)
+    flat = (up_z > up_threshold).float()
+    return landed * flat
+
+
 def hands_on_anchor_reward(env, box_cfg, left_hand_cfg, right_hand_cfg,
                             near_dist: float = 0.05,
                             kernel_std: float = 0.05):
@@ -1140,24 +1164,6 @@ def hand_lost_grip(env, box_cfg):
     not_on_table = box_z < TABLE_TOP_Z + 0.05
     early = env.episode_length_buf < 60
     return fell_far & not_on_table & early
-
-
-def box_touched_body(
-    env, box_cfg, trunk_cfg,
-    left_hip_cfg, right_hip_cfg,
-    left_shank_cfg, right_shank_cfg,
-    threshold: float = 0.15,
-):
-    """Termination when the box collapses into trunk, hips or shanks — blocks the "let box fall into the lap" attractor.
-    Args: env — RL env; box_cfg — box entity; trunk/left_hip/right_hip/left_shank/right_shank_cfg — body entities; threshold — box-centre-to-body-origin distance below which the box counts as touching.
-    Returns: (num_envs,) bool tensor.
-    """
-    box_pos = _entity_pos(env, box_cfg)
-    hit = torch.zeros(box_pos.shape[0], dtype=torch.bool, device=box_pos.device)
-    for cfg in (trunk_cfg, left_hip_cfg, right_hip_cfg, left_shank_cfg, right_shank_cfg):
-        dist = torch.linalg.norm(_entity_pos(env, cfg) - box_pos, dim=-1)
-        hit |= dist < threshold
-    return hit
 
 
 def body_touched_table(env, sensor_name: str = "body_table_contact",
@@ -1423,7 +1429,7 @@ def gated_hold_box_reward(env, left_hand_cfg, right_hand_cfg, box_cfg, trunk_cfg
     return hold_box_reward(env, left_hand_cfg, right_hand_cfg, box_cfg) * stability_gate(env, trunk_cfg, sensor_name)
 
 
-def gated_box_at_place_target_pos_reward(
+def box_at_place_target_pos_fused_reward(
     env, box_cfg, trunk_cfg, sensor_name,
     hand_box_sensor_name: str = "hand_box_contact",
     hand_force_threshold: float = 1.0,
@@ -1431,17 +1437,21 @@ def gated_box_at_place_target_pos_reward(
     sigma_xy: float = 0.30,
     sigma_z_above: float = 0.30,
     sigma_z_below: float = 0.05,
+    w_ungated: float = 2.0,
+    w_gated: float = 4.0,
 ):
-    """Multiply the box-at-place-target reward by stability_gate and hand_placement_gate so the incentive fires only during a stable, hand-supported descent.
-    Args: env — RL env; box_cfg — box entity; trunk_cfg — trunk entity; sensor_name — feet sensor; hand_box_sensor_name — hand-vs-box ContactSensor; hand_force_threshold — N above which the hand counts as holding; air_margin — clearance below which the box counts as landed; sigma_xy/sigma_z_above/sigma_z_below — Gaussian widths of the underlying reward.
-    Returns: (num_envs,) tensor in [0, 1].
+    """Fused ungated + double-gated tracking on box-to-place-target distance.
+    Base = box_at_place_target_pos_reward (broad-above / narrow-below Gaussian). Total = base * (w_ungated + w_gated * stability_gate * hand_placement_gate). Computes the base Gaussian once instead of twice — replaces the previous split of box_at_place_target_pos (gated, w=4) + box_at_place_target_pos_ungated (w=2), which evaluated the same Gaussian on every step.
+    Args: env — RL env; box_cfg — box entity; trunk_cfg — trunk entity for stability gate; sensor_name — feet sensor for stability gate; hand_box_sensor_name — narrowed hand-vs-box ContactSensor; hand_force_threshold — N above which the hand counts as still holding; air_margin — clearance above BOX_REST_Z used by hand_placement_gate to flip airborne/landed; sigma_xy / sigma_z_above / sigma_z_below — Gaussian widths passed through to box_at_place_target_pos_reward; w_ungated — always-on pull weight (dense placement gradient); w_gated — weight applied only while stability + hand-placement gates are both open.
+    Returns: (num_envs,) tensor.
     """
-    return (box_at_place_target_pos_reward(
+    base = box_at_place_target_pos_reward(
         env, box_cfg,
         sigma_xy=sigma_xy, sigma_z_above=sigma_z_above, sigma_z_below=sigma_z_below,
     )
-    * stability_gate(env, trunk_cfg, sensor_name)
-    * hand_placement_gate(env, box_cfg, hand_box_sensor_name, hand_force_threshold, air_margin))
+    gate = (stability_gate(env, trunk_cfg, sensor_name)
+            * hand_placement_gate(env, box_cfg, hand_box_sensor_name, hand_force_threshold, air_margin))
+    return base * (w_ungated + w_gated * gate)
 
 
 def gated_box_at_place_target_quat_reward(env, box_cfg, trunk_cfg, sensor_name):
@@ -1813,23 +1823,26 @@ def build_g1_drop_mdp():
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "w_left": 0.5, "w_right": 0.5},
         ),
-        # Place target: broad-above / narrow-below kernel (reverse of pick).
-        "box_at_place_target_pos":  RewardTermCfg(func=gated_box_at_place_target_pos_reward,  weight=4.0,
-                                                  params={"box_cfg": box, "trunk_cfg": trunk,
-                                                          "sensor_name": "feet_ground_contact",
-                                                          "sigma_xy": 0.30,
-                                                          "sigma_z_above": 0.30,
-                                                          "sigma_z_below": 0.05}),
-        # Ungated dense pull toward the place target; the gated term above zeros out until the stability + hand-placement gates open, which the 2026-08-10 run never triggered — the policy converged to "hold forever" for lack of a continuous placement gradient.
-        "box_at_place_target_pos_ungated": RewardTermCfg(
-            func=box_at_place_target_pos_reward, weight=2.0,
-            params={"box_cfg": box,
-                    "sigma_xy": 0.30, "sigma_z_above": 0.30, "sigma_z_below": 0.05},
+        # Place target: fused ungated + double-gated pull. w_ungated=2 gives a dense
+        # placement gradient (unlocks descent even before stability/hand gates open);
+        # w_gated=4 adds extra pay during a stable, hand-supported descent. Fused so
+        # the base broad-above/narrow-below Gaussian is computed once per step.
+        "box_at_place_target_pos": RewardTermCfg(
+            func=box_at_place_target_pos_fused_reward, weight=1.0,
+            params={"box_cfg": box, "trunk_cfg": trunk,
+                    "sensor_name": "feet_ground_contact",
+                    "hand_box_sensor_name": "hand_box_contact",
+                    "hand_force_threshold": 1.0, "air_margin": 0.03,
+                    "sigma_xy": 0.30, "sigma_z_above": 0.30, "sigma_z_below": 0.05,
+                    "w_ungated": 2.0, "w_gated": 4.0},
         ),
         # Fused box_upright + box_front_aligned + box_at_chest into box_carry_pose_bundle (w=1.5 each folded in).
         "box_carry_pose": RewardTermCfg(
             func=box_carry_pose_bundle_reward, weight=1.0,
-            params={"box_cfg": box, "w_upright": 1.5, "w_front": 1.5, "w_chest": 1.5},
+            # w_chest=0: box_at_chest attractor was inherited from policy_carry and
+            # actively fought the descent. Keep upright + front-aligned, drop the
+            # chest pull so the policy sees no reward penalty for lowering the box.
+            params={"box_cfg": box, "w_upright": 1.5, "w_front": 1.5, "w_chest": 0.0},
         ),
         # Dense linear signal for every centimetre of descent, gated on holding.
         "descent_progress": RewardTermCfg(func=gated_descent_progress_reward, weight=3.0,
@@ -1868,6 +1881,14 @@ def build_g1_drop_mdp():
                     "target_values": WALK_READY_ARM_TARGET,
                     "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
         ),
+        # Step-wise "landed + flat" bonus without any hand gate. Lets the policy
+        # cross the airborne->landed threshold and see a positive gradient before
+        # also having to release the grasp anchors. Breaks the hover-just-above
+        # local optimum that fully-gated landing rewards leave in place.
+        "box_landed_flat": RewardTermCfg(
+            func=box_landed_flat_bonus, weight=3.0,
+            params={"box_cfg": box, "air_margin": 0.03, "up_threshold": 0.95},
+        ),
         # Fused free_fall + hand_lost_grip + box_jammed into box_unsupported_bundle; all three read (dl, dr, box_z, box_vz), computed once and shared.
         "box_unsupported": RewardTermCfg(
             func=box_unsupported_bundle_penalty, weight=1.0,
@@ -1888,9 +1909,9 @@ def build_g1_drop_mdp():
             func=walk_to_target_bundle_reward, weight=1.0,
             params={"sigma": 1.0, "w_target": 2.0, "w_progress": 1.0},
         ),
-        "stay_still":     RewardTermCfg(func=stay_still_penalty,    weight=-0.5,
-                                        params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                                                "box_cfg": box, "gate_dist": 0.20}),
+        # stay_still removed: its gate (hands-near-anchors) is always open while
+        # holding the box, so the -0.5 * |v|^2 penalty was applied to every attempt
+        # at leaning/stepping forward to place the box — the exact motion drop needs.
         "symmetric_pose": RewardTermCfg(func=symmetric_pose_penalty, weight=-0.3,
                                         params={"left_cfg": left_sym, "right_cfg": right_sym}),
         # Smoothness bundle (pick_normal ETH-style weights).
@@ -2000,22 +2021,13 @@ def build_g1_drop_mdp():
         "hand_lost_grip": TerminationTermCfg(
             func=hand_lost_grip, params={"box_cfg": box},
         ),
-        # Kill the "let box collapse into the lap" attractor: if box centre gets within 15 cm of trunk/hip/shank origin, the grip has failed inward rather than downward.
-        "box_touched_body": TerminationTermCfg(
-            func=box_touched_body,
-            params={
-                "box_cfg": box, "trunk_cfg": trunk,
-                "left_hip_cfg": left_hip, "right_hip_cfg": right_hip,
-                "left_shank_cfg": left_shank, "right_shank_cfg": right_shank,
-            },
-        ),
         # Kill the "slump onto the tabletop after placing the box" attractor via physics contact between torso/hip/knee geoms and the table — catches lying on the box, thigh on the edge, etc.
         "body_touched_table": TerminationTermCfg(
             func=body_touched_table,
             params={"sensor_name": body_table_contact_cfg.name,
                     "force_threshold": 5.0},
         ),
-        # Kill the "rest legs on the box" attractor via physics contact between torso/hip/thigh/shin subtree and the box; complements the geometric box_touched_body which misses shank-on-top-of-box at ~15 cm.
+        # Kill the "let box collapse into the lap / rest legs on the box" attractor via physics contact between torso/hip/knee/ankle geoms and the box. Replaces the previous pair (geometric box_touched_body + sensor-based body_touched_box) — the sensor covers a strict superset of the geometric check (torso + all hip axes + knee + ankle_pitch) with actual contact forces, so the distance test was redundant.
         "body_touched_box": TerminationTermCfg(
             func=body_touched_box,
             params={"sensor_name": body_box_contact_cfg.name,
@@ -2090,8 +2102,11 @@ def g1_drop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             contact_sensor_maxmatch=500,
             mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=30),
         ),
-        # decimation 5 -> 10: policy runs at 20 Hz instead of 40 Hz while physics still ticks at 200 Hz; halving the policy rate smooths the action stream and cuts the high-frequency jitter observed at 40 Hz (episode step count drops from 130 to 65 at the same wall-clock horizon).
-        decimation=10,
+        # decimation 5: policy at 40 Hz, physics at 200 Hz. Reverted from 10 -> 5
+        # to match pick and cut per-iter wall clock by ~22%. If action jitter
+        # reappears, raise action_rate_l2 / action_2nd_order first before bumping
+        # decimation back up.
+        decimation=5,
         episode_length_s=3.25,
     )
     if play:

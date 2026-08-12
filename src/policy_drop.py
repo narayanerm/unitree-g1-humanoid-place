@@ -93,6 +93,16 @@ G1_FOOT_GEOMS = tuple(
 # Walk-ready arm target ordered to match HOLDING_ARM_JOINTS so arm_pose_walk_ready_reward can index either arm_asset.joint_ids or HOLDING_ARM_JOINTS interchangeably; shapes the drop's terminal snapshot for a clean hand-off back to the walk policy.
 WALK_READY_ARM_TARGET = tuple(G1_HOME_JOINT_POS[j] for j in HOLDING_ARM_JOINTS)
 
+# Leg + waist joints in a fixed order; used by legs_waist_pose_walk_ready_reward to pull the lower body toward the walk-policy home pose once the box has landed and the hands released. Complements WALK_READY_ARM_TARGET which only shapes the 14 arm joints — without this the policy has no gradient pulling hips/knees/waist away from the deep-squat PLACED_JOINT_POS terminal, so the trained end-state is "leaning on the table on the thighs".
+LEGS_WAIST_JOINTS = (
+    "left_hip_pitch_joint",  "left_hip_roll_joint",  "left_hip_yaw_joint",
+    "left_knee_joint",       "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint",      "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+)
+WALK_READY_LEGS_WAIST_TARGET = tuple(G1_HOME_JOINT_POS[j] for j in LEGS_WAIST_JOINTS)
+
 
 # Scene and target geometry.
 TABLE_X          = 0.60
@@ -1232,6 +1242,35 @@ def arm_pose_walk_ready_reward(
     return gate * torch.exp(-mean_sq_err / (2.0 * sigma * sigma))
 
 
+def legs_waist_pose_walk_ready_reward(
+    env, box_cfg, left_hand_cfg, right_hand_cfg, legs_waist_cfg,
+    target_values: tuple[float, ...] = WALK_READY_LEGS_WAIST_TARGET,
+    sigma: float = 0.30,
+    air_margin: float = 0.03,
+    release_dist: float = 0.15,
+):
+    """Shape the terminal leg + waist pose toward G1_HOME_JOINT_POS once the box has landed and the hands released — the lower-body twin of arm_pose_walk_ready_reward. Without this the reverse-curriculum PLACED_JOINT_POS (deep squat with waist_pitch=0.90) is the only "goal" the policy sees, so it converges to a thighs-on-table posture even after release.
+    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities for the release gate; legs_waist_cfg — SceneEntityCfg selecting the 15 leg+waist joints in LEGS_WAIST_JOINTS order; target_values — per-joint targets aligned with legs_waist_cfg.joint_ids; sigma — Gaussian bandwidth (rad) on the RMS joint error; air_margin — clearance above BOX_REST_Z below which the box counts as landed; release_dist — min hand-to-anchor distance for the release gate.
+    Returns: (num_envs,) tensor in [0, 1].
+    """
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    landed = (box_z < BOX_REST_Z + air_margin)
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    released = (dl > release_dist) & (dr > release_dist)
+    gate = (landed & released).float()
+
+    robot = env.scene["robot"]
+    joints = robot.data.joint_pos[:, legs_waist_cfg.joint_ids]
+    if not hasattr(env, "_walk_ready_legs_waist_target_cache"):
+        env._walk_ready_legs_waist_target_cache = torch.tensor(
+            target_values, device=env.device, dtype=joints.dtype,
+        )
+    err = joints - env._walk_ready_legs_waist_target_cache
+    mean_sq_err = (err * err).mean(dim=-1)
+    return gate * torch.exp(-mean_sq_err / (2.0 * sigma * sigma))
+
+
 def box_landed_flat_bonus(env, box_cfg,
                            air_margin: float = 0.03,
                            up_threshold: float = 0.95):
@@ -1819,6 +1858,7 @@ def build_g1_drop_mdp():
 
     g1_asset      = SceneEntityCfg("robot", joint_names=G1_JOINTS, preserve_order=True)
     arm_asset     = SceneEntityCfg("robot", joint_names=HOLDING_ARM_JOINTS, preserve_order=True)
+    legs_waist_asset = SceneEntityCfg("robot", joint_names=LEGS_WAIST_JOINTS, preserve_order=True)
     left_sym      = SceneEntityCfg("robot", joint_names=_LEFT_SYM_JOINTS,  preserve_order=True)
     right_sym     = SceneEntityCfg("robot", joint_names=_RIGHT_SYM_JOINTS, preserve_order=True)
     wrist_acts    = SceneEntityCfg("robot", actuator_names=(r".*wrist.*",), preserve_order=True)
@@ -2035,6 +2075,19 @@ def build_g1_drop_mdp():
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "arm_cfg": arm_asset,
                     "target_values": WALK_READY_ARM_TARGET,
+                    "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
+        ),
+        # Lower-body twin of arm_pose_walk_ready. PLACED_JOINT_POS is a deep squat
+        # (hip_pitch=-0.80, knee=1.40, waist_pitch=0.90) — the only terminal state
+        # the reverse curriculum shows the policy, so it converges to "leaning on
+        # the table on the thighs" even after release. This term pulls hips /
+        # knees / waist toward the walk-policy home pose once box is landed and
+        # released, giving a continuous gradient away from the squat.
+        "legs_waist_pose_walk_ready": RewardTermCfg(
+            func=legs_waist_pose_walk_ready_reward, weight=2.0,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "legs_waist_cfg": legs_waist_asset,
+                    "target_values": WALK_READY_LEGS_WAIST_TARGET,
                     "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
         ),
         # Step-wise "landed + flat" bonus without any hand gate. Lets the policy

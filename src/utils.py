@@ -1,8 +1,8 @@
-###############################################################################
-# Project    : Humanoid Loco-Manipulation with the Unitree G1                 #
-# Developer  : Narayane Ribeiro Medeiros                                      #
-# Repository : https://github.com/narayanerm/Humanoid-Loco-Manipulation       #
-###############################################################################
+##########################################################################################
+# Project    : unitree-g1-humanoid-place                                                 #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-place                   #
+##########################################################################################
 """Shared utilities for the notebooks: checkpoint discovery, TB parsing, math helpers.
 
 Input:  paths under ``outputs/logs/`` produced by rsl_rl / TensorBoard.
@@ -20,10 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def find_latest_checkpoint(log_root: str | Path, experiment_hint: str = "") -> Path | None:
     """Locate the most recently modified model_*.pt beneath log_root.
-    Args: log_root — search root; experiment_hint — exact-match on a path SEGMENT
-    (typically the experiment directory name, e.g. "g1_carry"). Using a segment
-    match — not substring — avoids `g1_carry` picking up `g1_carry_slosh` /
-    `g1_carry_soft` / etc. by accident.
+    Args: log_root: search root; experiment_hint: exact match on a path SEGMENT (not substring), e.g. "g1_carry" will not match "g1_carry_slosh".
     Returns: Path to the newest checkpoint, or None if nothing matched.
     """
     root = Path(log_root).expanduser()
@@ -36,7 +33,7 @@ def find_latest_checkpoint(log_root: str | Path, experiment_hint: str = "") -> P
 
 def checkpoint_obs_dim(ckpt_path: str | Path) -> int:
     """Return the actor's input dimension baked into a saved checkpoint.
-    Args: ckpt_path — path to a ``model_*.pt`` file.
+    Args: ckpt_path: path to a ``model_*.pt`` file.
     Returns: input dim (int) inferred from the first MLP layer weight.
     """
     import torch
@@ -47,7 +44,7 @@ def checkpoint_obs_dim(ckpt_path: str | Path) -> int:
 
 def parse_tb_reward(log_dir: str | Path, tag: str = "Train/mean_reward") -> tuple[list[int], list[float]]:
     """Read scalar values for a tag from a TensorBoard event file.
-    Args: log_dir — directory holding events file; tag — scalar tag name.
+    Args: log_dir: directory holding events file; tag: scalar tag name.
     Returns: tuple (steps list, values list); empty on failure.
     """
     try:
@@ -64,7 +61,7 @@ def parse_tb_reward(log_dir: str | Path, tag: str = "Train/mean_reward") -> tupl
 
 def find_latest_tb_log(log_root: str | Path, experiment_hint: str = "") -> Path | None:
     """Locate the directory holding the newest TensorBoard event file.
-    Args: log_root — search root; experiment_hint — substring filter on path.
+    Args: log_root: search root; experiment_hint: substring filter on path.
     Returns: Path to the parent directory, or None if no events file was found.
     """
     root = Path(log_root).expanduser()
@@ -109,7 +106,7 @@ def export_policy_to_onnx(
     obs_group: str = "actor",
 ) -> Path:
     """Export a trained rsl-rl actor to a deployable .onnx with embedded metadata.
-    Args: checkpoint_path — trained actor .pt; task_id — mjlab task; out_path — .onnx destination; obs_group — obs group key to export.
+    Args: checkpoint_path: trained actor .pt; task_id: mjlab task; out_path: .onnx destination; obs_group: obs group key to export.
     Returns: Path to the written .onnx file.
     """
     import json
@@ -136,9 +133,9 @@ def export_policy_to_onnx(
     runner = runner_cls(env, asdict(cfg.agent), "/tmp/onnx_export_runner", device)
 
     # Trunk-frozen-diagnostic checkpoints replaced mlp.6 with Sequential; mirror the swap so shapes match.
-    _sd = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    if any(k.startswith("actor.mlp.6.0.") for k in _sd.get("actor_state_dict", {})) or \
-       any(k.startswith("mlp.6.0.")       for k in _sd.get("actor_state_dict", {})):
+    sd = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    if any(k.startswith("actor.mlp.6.0.") for k in sd.get("actor_state_dict", {})) or \
+       any(k.startswith("mlp.6.0.")       for k in sd.get("actor_state_dict", {})):
         old_head = runner.alg.actor.mlp[6]
         in_dim, out_dim = old_head.in_features, old_head.out_features
         runner.alg.actor.mlp[6] = nn.Sequential(
@@ -158,7 +155,7 @@ def export_policy_to_onnx(
 
         def __init__(self, actor_ref):
             """Capture normaliser stats and MLP from a trained actor.
-            Args: actor_ref — trained actor exposing obs_normalizer and mlp.
+            Args: actor_ref: trained actor exposing obs_normalizer and mlp.
             Returns: none.
             """
             super().__init__()
@@ -169,7 +166,7 @@ def export_policy_to_onnx(
 
         def forward(self, obs: torch.Tensor) -> torch.Tensor:
             """Normalise raw observations and produce the deterministic action.
-            Args: obs — raw observation tensor.
+            Args: obs: raw observation tensor.
             Returns: action tensor from the MLP mean output.
             """
             x = (obs - self.norm_mean) / (self.norm_std + self.eps)
@@ -219,7 +216,7 @@ def export_policy_to_onnx(
 
 def smooth01(x: np.ndarray | float) -> np.ndarray | float:
     """Smoothstep clamp: map [0, 1] to [0, 1] with zero endpoint derivatives.
-    Args: x — scalar or array to clamp and smooth.
+    Args: x: scalar or array to clamp and smooth.
     Returns: smoothed value of the same shape.
     """
     x = np.clip(x, 0.0, 1.0)
@@ -228,7 +225,7 @@ def smooth01(x: np.ndarray | float) -> np.ndarray | float:
 
 def lerp(a: np.ndarray | float, b: np.ndarray | float, t: float) -> np.ndarray | float:
     """Smoothstep-blended interpolation between a and b.
-    Args: a — start value; b — end value; t — parameter in [0, 1].
+    Args: a: start value; b: end value; t: parameter in [0, 1].
     Returns: interpolated value shaped like a/b.
     """
     return a + (b - a) * smooth01(t)

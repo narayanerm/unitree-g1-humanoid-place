@@ -1,8 +1,8 @@
-###############################################################################
-# Project    : Humanoid Loco-Manipulation with the Unitree G1                 #
-# Developer  : Narayane Ribeiro Medeiros                                      #
-# Repository : https://github.com/narayanerm/Humanoid-Loco-Manipulation       #
-###############################################################################
+##########################################################################################
+# Project    : unitree-g1-humanoid-place                                                 #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-place                   #
+##########################################################################################
 """Generic terminal-state buffer collector: rolls out any trained policy and dumps snapshots to .npz.
 
 Input:  trained checkpoint (--checkpoint), target policy module (--policy-module), output path (--out).
@@ -41,7 +41,7 @@ def collect(
     seed: int = 0,
 ) -> Path:
     """Roll out `policy_module`'s trained policy and store yaw-aligned snapshots to `.npz`.
-    Args: policy_module — dotted path (e.g. 'src.policy_walk'); checkpoint — trained .pt; out_path — output .npz; num_envs — parallel envs; n_snapshots — target sample count; min_steps/max_steps — random horizon bounds (used when no snapshot_predicate); device — torch device; seed — RNG seed.
+    Args: policy_module: dotted path (e.g. 'src.policy_walk'); checkpoint: trained .pt; out_path: output .npz; num_envs: parallel envs; n_snapshots: target sample count; min_steps/max_steps: random horizon bounds (used when no snapshot_predicate); device: torch device; seed: RNG seed.
     Returns: Path to the written .npz.
     """
     from mjlab.envs import ManagerBasedRlEnv
@@ -119,7 +119,7 @@ def collect(
 def _snapshot(base_env, env_ids, entities, yaw_align, buf,
               quat_mul, quat_apply, quat_from_euler_xyz) -> None:
     """Append yaw-aligned snapshots for the requested entities to `buf`.
-    Args: base_env — ManagerBasedRlEnv; env_ids — envs to snapshot; entities — subset of {"robot","box"}; yaw_align — rotate world tensors into robot body-yaw frame; buf — dict of tensor lists to extend; quat_* — mjlab math helpers.
+    Args: base_env: ManagerBasedRlEnv; env_ids: envs to snapshot; entities: subset of {"robot","box"}; yaw_align: rotate world tensors into robot body-yaw frame; buf: dict of tensor lists to extend; quat_*: mjlab math helpers.
     Returns: none.
     """
     robot = base_env.scene["robot"]
@@ -165,7 +165,7 @@ def _snapshot(base_env, env_ids, entities, yaw_align, buf,
 
 def _yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
     """Extract the yaw angle from a wxyz quaternion.
-    Args: q — quaternion tensor with last dim = 4.
+    Args: q: quaternion tensor with last dim = 4.
     Returns: yaw angle tensor with one fewer dim.
     """
     w, x, y, z = q.unbind(-1)

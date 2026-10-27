@@ -1302,6 +1302,62 @@ def post_place_stay_still_penalty(
     return gate * (w_lin * (v * v).sum(dim=-1) + w_ang * (w * w).sum(dim=-1))
 
 
+def post_place_slow_joint_penalty(
+    env, box_cfg, left_hand_cfg, right_hand_cfg,
+    air_margin: float = 0.03,
+    release_dist: float = 0.15,
+):
+    """Penalise sum of squared joint velocities across all 29 G1 joints, double-gated on (landed AND released) using the same condition as arm_pose_walk_ready_reward. Opens exactly when arm_pose_walk_ready and legs_waist_pose_walk_ready start paying for closeness to home, so the policy is pushed toward slow approach rather than snapping into the home pose: a 5 rad/s snap costs ~725 per step, while a 1 rad/s steady return costs ~29 per step, enough contrast at weight=-0.02 to flip the net preference toward slow return without erasing the walk-ready attractor.
+    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities; air_margin: clearance below BOX_REST_Z at which the box counts as landed; release_dist: min hand-to-anchor distance for the release gate.
+    Returns: (num_envs,) tensor >= 0.
+    """
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    landed = (box_z < BOX_REST_Z + air_margin)
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    released = (dl > release_dist) & (dr > release_dist)
+    gate = (landed & released).float()
+
+    qd = env.scene["robot"].data.joint_vel
+    return gate * (qd * qd).sum(dim=-1)
+
+
+def box_misplaced_penalty(
+    env, box_cfg,
+    air_margin: float = 0.03,
+    pos_tol: float = 0.03,
+    pos_cap: float = 0.30,
+    yaw_cap_deg: float = 60.0,
+    w_pos: float = 1.0,
+    w_yaw: float = 0.5,
+):
+    """Penalty that fires once the box has landed and grows with distance (xy position + yaw) from the commanded place target. Zero while airborne so descent is never punished prematurely; zero inside a pos_tol dead-zone around the target so near-perfect landings are not nicked; saturates at pos_cap horizontal distance and yaw_cap orientation error.
+    Rationale: hand_release (w=15), box_landed_flat (w=3), arm_pose_walk_ready (w=1.5) and legs_waist_pose_walk_ready (w=2) all fire whenever the box lands regardless of position, so "release anywhere flat" is reward-positive on its own. This term offsets those bonuses so landing far from the commanded target becomes strictly worse than keeping the box in hand.
+    Args: env: RL env; box_cfg: box entity; air_margin: clearance below BOX_REST_Z at which the box counts as landed; pos_tol: distance under which pos penalty stays zero (m); pos_cap: saturation distance for pos penalty (m); yaw_cap_deg: saturation yaw error (deg); w_pos: inner weight on pos signal; w_yaw: inner weight on yaw signal.
+    Returns: (num_envs,) tensor >= 0.
+    """
+    _ensure_cmd_buffers(env)
+    box_pos = _entity_pos(env, box_cfg)
+    tgt_pos = env.extras[_CMD_KEY + "place_target_pos"]
+    box_z = box_pos[:, 2]
+    landed = (box_z < BOX_REST_Z + air_margin).float()
+
+    xy_dist = torch.linalg.norm(box_pos[:, :2] - tgt_pos[:, :2], dim=-1)
+    pos_err = torch.clamp(xy_dist - pos_tol, min=0.0, max=pos_cap - pos_tol)
+    pos_err_norm = pos_err / max(pos_cap - pos_tol, 1e-6)
+
+    box_quat = env.scene[box_cfg.name].data.root_link_quat_w
+    tgt_quat = env.extras[_CMD_KEY + "place_target_quat"]
+    cos_half = (box_quat * tgt_quat).sum(dim=-1).abs()
+    # 1 - cos_half^2 maps 0 at aligned to 1 at 180 deg; normalise so error at yaw_cap_deg equals 1.
+    quat_err = torch.clamp(1.0 - cos_half * cos_half, 0.0, 1.0)
+    cos_half_cap = math.cos(math.radians(yaw_cap_deg) * 0.5)
+    yaw_scale = max(1.0 - cos_half_cap * cos_half_cap, 1e-6)
+    yaw_err_norm = torch.clamp(quat_err / yaw_scale, 0.0, 1.0)
+
+    return landed * (w_pos * pos_err_norm + w_yaw * yaw_err_norm)
+
+
 def box_landed_flat_bonus(env, box_cfg,
                            air_margin: float = 0.03,
                            up_threshold: float = 0.95):
@@ -2159,6 +2215,13 @@ def build_g1_drop_mdp():
                     "air_margin": 0.03, "release_dist": 0.15,
                     "w_lin": 1.0, "w_ang": 0.1},
         ),
+        # Post-placement slow-joint cost: same (landed AND released) gate but on sum of squared joint velocities across all 29 G1 joints. Combats the "snap to home" pattern once arm_pose_walk_ready and legs_waist_pose_walk_ready open, pulling the return trajectory toward slow approach instead of a fast flick.
+        "post_place_slow_joint": RewardTermCfg(
+            func=post_place_slow_joint_penalty, weight=-0.02,
+            params={"box_cfg": box,
+                    "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "air_margin": 0.03, "release_dist": 0.15},
+        ),
         # Step-wise "landed + flat" bonus without any hand gate. Lets the policy
         # cross the airborne->landed threshold and see a positive gradient before
         # also having to release the grasp anchors. Breaks the hover-just-above
@@ -2166,6 +2229,13 @@ def build_g1_drop_mdp():
         "box_landed_flat": RewardTermCfg(
             func=box_landed_flat_bonus, weight=3.0,
             params={"box_cfg": box, "air_margin": 0.03, "up_threshold": 0.95},
+        ),
+        # Active cost for off-target landings in both xy position and yaw. hand_release (w=15), box_landed_flat (w=3), arm/legs_waist_pose_walk_ready (w=1.5+2) together pay ~21/step the moment the box touches down regardless of where, so "drop-and-walk-away" is positive-return on its own. This penalty saturates at -w_pos-w_yaw per step for a landing at pos_cap distance and yaw_cap orientation error; sized so dropping at the pos_cap/yaw_cap corner over the full post-release horizon outweighs the landed bonuses, inverting the net sign and making "keep carrying until aligned" strictly better than "drop here".
+        "box_misplaced": RewardTermCfg(
+            func=box_misplaced_penalty, weight=-10.0,
+            params={"box_cfg": box, "air_margin": 0.03,
+                    "pos_tol": 0.03, "pos_cap": 0.30, "yaw_cap_deg": 60.0,
+                    "w_pos": 1.0, "w_yaw": 0.5},
         ),
         # Fused free_fall + hand_lost_grip + box_jammed into box_unsupported_bundle; all three read (dl, dr, box_z, box_vz), computed once and shared.
         "box_unsupported": RewardTermCfg(

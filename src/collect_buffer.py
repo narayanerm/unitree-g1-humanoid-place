@@ -8,6 +8,13 @@
 Input:  trained checkpoint (--checkpoint), target policy module (--policy-module), output path (--out).
 Output: .npz keyed by SNAPSHOT_ENTITIES declared on the module (robot always, box optional).
 
+By default the saved buffer is doubled with sagittal mirrors of each sample
+(--no-mirror to disable). This keeps any downstream reset distribution
+symmetric by construction, which matters because rsl_rl's EmpiricalNormalization
+fits its running stats on rollout samples only and bakes in any lateral bias
+present in the reset buffer, that bias then fights the symmetry augmentation
+during training.
+
 Contract expected on the policy module:
     TASK_ID: str
     register() -> None
@@ -39,9 +46,10 @@ def collect(
     max_steps: int = 400,
     device: str = "cuda:0",
     seed: int = 0,
+    mirror: bool = True,
 ) -> Path:
     """Roll out `policy_module`'s trained policy and store yaw-aligned snapshots to `.npz`.
-    Args: policy_module: dotted path (e.g. 'src.policy_walk'); checkpoint: trained .pt; out_path: output .npz; num_envs: parallel envs; n_snapshots: target sample count; min_steps/max_steps: random horizon bounds (used when no snapshot_predicate); device: torch device; seed: RNG seed.
+    Args: policy_module: dotted path (e.g. 'src.policy_walk'); checkpoint: trained .pt; out_path: output .npz; num_envs: parallel envs; n_snapshots: target sample count; min_steps/max_steps: random horizon bounds (used when no snapshot_predicate); device: torch device; seed: RNG seed; mirror: if True, double the saved buffer with sagittal-mirrored copies.
     Returns: Path to the written .npz.
     """
     from mjlab.envs import ManagerBasedRlEnv
@@ -107,10 +115,14 @@ def collect(
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_path,
-        **{k: torch.cat(v)[:n_snapshots].cpu().numpy() for k, v in buf.items()},
-    )
+    payload = {k: torch.cat(v)[:n_snapshots].cpu().numpy() for k, v in buf.items()}
+    if mirror:
+        from src.symmetry import mirror_snapshot_buffer
+        n_before = next(iter(payload.values())).shape[0]
+        payload = mirror_snapshot_buffer(payload)
+        n_after = next(iter(payload.values())).shape[0]
+        print(f"{tag} mirror-doubled buffer: {n_before} -> {n_after} samples")
+    np.savez_compressed(out_path, **payload)
     base_env.close()
     print(f"{tag} wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
     return out_path
@@ -188,6 +200,10 @@ def _main() -> None:
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mirror", dest="mirror", action="store_true", default=True,
+                    help="double the buffer with sagittal-mirrored samples (default: on)")
+    ap.add_argument("--no-mirror", dest="mirror", action="store_false",
+                    help="disable sagittal mirror augmentation of the saved buffer")
     args = ap.parse_args()
 
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -205,6 +221,7 @@ def _main() -> None:
         max_steps=args.max_steps,
         device=args.device,
         seed=args.seed,
+        mirror=args.mirror,
     )
 
 

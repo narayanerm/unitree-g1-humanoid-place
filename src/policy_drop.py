@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 
 import mujoco
 import torch
@@ -45,6 +46,25 @@ from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+
+
+@dataclass
+class RslRlPpoAlgorithmCfgWithSymmetry(RslRlPpoAlgorithmCfg):
+    """PPO cfg extended with rsl_rl's native symmetry_cfg hook.
+    dict form: {"use_data_augmentation": bool, "use_mirror_loss": bool,
+                 "mirror_loss_coeff": float, "data_augmentation_func": str_or_callable}
+    """
+    symmetry_cfg: dict | None = None
+
+
+# Mirror augmentation toggle: False sends symmetry_cfg=None into g1_drop_ppo_runner_cfg() so rsl_rl skips the extra mirror forward; use_data_augmentation only (adding use_mirror_loss in carry produced a biased fixed point with spine tilt + asymmetric elbows).
+USE_MIRROR_AUGMENTATION = True
+SYMMETRY_CFG = {
+    "use_data_augmentation": True,
+    "use_mirror_loss": False,
+    "mirror_loss_coeff": 0.0,
+    "data_augmentation_func": "src.symmetry:mirror_g1_drop",
+}
 
 
 TASK_ID = "Mjlab-G1-Drop"
@@ -2508,11 +2528,12 @@ def g1_drop_ppo_runner_cfg():
             distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.30, "std_type": "scalar"},
         ),
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
-        algorithm=RslRlPpoAlgorithmCfg(
+        algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
             entropy_coef=0.001,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
             gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
+            symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,
         ),
         clip_actions=3.0,
         experiment_name="g1_drop", save_interval=50, num_steps_per_env=24,

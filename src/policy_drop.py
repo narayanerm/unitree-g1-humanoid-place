@@ -562,8 +562,36 @@ def reset_from_carry_buffer(
     root_z_w = root_z + origins[:, 2:3]
     root_pos_w = torch.cat([root_xy, root_z_w], dim=-1)
 
-    # Write robot first so sim.forward below propagates the lerped joints and we can read
-    # the resulting hand positions to place the box between them.
+    # Analytical FK of the box position: since arms stay at the carry buffer values and
+    # only legs+waist lerp toward PLACED, the box (rigidly held by the hands) rotates
+    # with the chest around the waist pitch axis. Approximating that axis as passing
+    # through the pelvis origin gives a rotation of the carry box position in pelvis
+    # frame by the lerped waist pitch around the y-axis. Matches sim.forward() within
+    # ~1.5 cm across all bb (hand geom is ~5 cm, so contact still binds hands on box),
+    # while avoiding a full sim.forward() per reset (was ~15-20% of training wall clock).
+    placed_waist_pitch = PLACED_JOINT_POS["waist_pitch_joint"]  # 0.9 rad
+    lerped_waist_pitch = bb * placed_waist_pitch  # scalar; carry waist_pitch ~0 so skipped
+    cos_p = math.cos(lerped_waist_pitch)
+    sin_p = math.sin(lerped_waist_pitch)
+    # rotate_y(theta) applied to [x, y, z]: [x*cos + z*sin, y, -x*sin + z*cos]
+    box_x = carry_box_pos_by[:, 0] * cos_p + carry_box_pos_by[:, 2] * sin_p
+    box_y = carry_box_pos_by[:, 1]
+    box_z = -carry_box_pos_by[:, 0] * sin_p + carry_box_pos_by[:, 2] * cos_p
+    box_in_pelvis_lerp = torch.stack([box_x, box_y, box_z], dim=-1)
+
+    # Hemisphere-align carry box quat against placed before lerping (half of the buffer
+    # has w<0, which would collapse the quaternion lerp through the origin at bb~0.5).
+    carry_box_quat_w = quat_mul(q_yaw, carry_box_quat_by)
+    dot_box = (placed_box_quat_w * carry_box_quat_w).sum(dim=-1, keepdim=True)
+    carry_box_quat_aligned = torch.where(dot_box < 0, -carry_box_quat_w, carry_box_quat_w)
+    box_quat_w = bb * placed_box_quat_w + (1.0 - bb) * carry_box_quat_aligned
+    box_quat_w = box_quat_w / torch.linalg.norm(
+        box_quat_w, dim=-1, keepdim=True,
+    ).clamp(min=1e-6)
+
+    box_pos_w = root_pos_w + quat_apply(q_yaw, box_in_pelvis_lerp)
+
+    # Physics writes.
     robot.write_root_link_pose_to_sim(
         torch.cat([root_pos_w, root_quat_w], dim=-1), env_ids=env_ids,
     )
@@ -577,32 +605,6 @@ def reset_from_carry_buffer(
         joint_pos, torch.zeros_like(joint_pos),
         env_ids=env_ids, joint_ids=joint_ids,
     )
-
-    # Settle FK so xpos of the wrist links reflects the newly-written joint pose, then
-    # read the wrist positions and place the box between them. Cache the body IDs on
-    # first call; they are static for the model.
-    import mujoco
-    if "_drop_wrist_body_ids" not in env.extras:
-        mj_model = env.sim.mj_model
-        l_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/left_wrist_yaw_link")
-        r_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/right_wrist_yaw_link")
-        env.extras["_drop_wrist_body_ids"] = torch.tensor([l_id, r_id], dtype=torch.long, device=device)
-    wrist_ids = env.extras["_drop_wrist_body_ids"]
-    env.scene.write_data_to_sim()
-    env.sim.forward()
-    xpos = env.sim.data.xpos.data  # (num_envs, nbody, 3)
-    left_wrist_w  = xpos[env_ids, wrist_ids[0], :]
-    right_wrist_w = xpos[env_ids, wrist_ids[1], :]
-    box_pos_w  = 0.5 * (left_wrist_w + right_wrist_w)
-    # Box orientation lerped between carry buffer (rotated by yaw) and placed (identity).
-    carry_box_quat_w = quat_mul(q_yaw, carry_box_quat_by)
-    dot_box = (placed_box_quat_w * carry_box_quat_w).sum(dim=-1, keepdim=True)
-    carry_box_quat_aligned = torch.where(dot_box < 0, -carry_box_quat_w, carry_box_quat_w)
-    box_quat_w = bb * placed_box_quat_w + (1.0 - bb) * carry_box_quat_aligned
-    box_quat_w = box_quat_w / torch.linalg.norm(
-        box_quat_w, dim=-1, keepdim=True,
-    ).clamp(min=1e-6)
-
     box: Entity = env.scene[box_cfg.name]
     box.write_root_link_pose_to_sim(
         torch.cat([box_pos_w, box_quat_w], dim=-1), env_ids=env_ids,

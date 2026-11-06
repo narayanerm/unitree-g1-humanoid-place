@@ -2310,9 +2310,14 @@ def build_g1_drop_mdp():
         # cliff and let the policy "toss and pull hand away" as soon as the box
         # was near the top). gate_z 0.05 -> 0.35 turns this into a dense
         # descent-long gradient starting at ~chest height; w_ang added to catch
-        # the flick-of-the-wrist that comes with an early release.
+        # the flick-of-the-wrist that comes with an early release. Weight raised
+        # from -6.0 to -12.0 so the per-step impact penalty matches the magnitude
+        # of hand_release (+15 per-step after landing): under -6 the policy
+        # collects ~1800 from hand_release across the post-landing phase while
+        # paying only ~-90 on descent, so "toss and let gravity do the rest" was
+        # still net positive; -12 closes that gap.
         "box_impact_vel": RewardTermCfg(
-            func=box_impact_velocity_penalty, weight=-6.0,
+            func=box_impact_velocity_penalty, weight=-12.0,
             params={"box_cfg": box, "gate_z": 0.35, "w_lin": 1.0, "w_ang": 0.1},
         ),
         "hand_approach_vel": RewardTermCfg(

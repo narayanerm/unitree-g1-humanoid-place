@@ -130,7 +130,7 @@ TABLE_HEIGHT     = 0.44
 TABLE_TOP_HALF   = 0.04
 TABLE_TOP_Z      = TABLE_HEIGHT + TABLE_TOP_HALF
 BOX_HALF         = 0.105
-BOX_START_X      = TABLE_X - 0.09
+BOX_START_X      = TABLE_X - 0.15
 BOX_REST_Z       = TABLE_TOP_Z + BOX_HALF   # box centre when resting flat on the table
 BOX_MASS_MIN     = 0.30
 BOX_MASS_MAX     = 3.00
@@ -399,16 +399,20 @@ PLACED_JOINT_POS = {
     "waist_yaw_joint":         0.0,
     "waist_roll_joint":        0.0,
     "waist_pitch_joint":       0.90,
-    # Arms: strong shoulder_pitch forward-down, shoulder_roll opened outward to y~±0.13, elbow moderately bent (~63°) so the pose is visibly bent. Empirical FK sweep places the wrists at (0.502, ±0.107, 0.627), a few cm from the box side-face anchors.
+    # Arms: strong shoulder_pitch forward-down, shoulder_roll opened outward so wrists land
+    # outside the box lateral faces. shoulder_roll was 0.25 which put the wrist at y=+/-0.107
+    # (only 2 mm clearance from the box face at y=+/-0.105): the palm geom extending inward
+    # from the wrist ended up inside the box on reset. 0.40 pushes wrists to y~+/-0.16
+    # (~5 cm clearance) so the whole hand clears the box face. Matches pick's SQUAT_GRIP fix.
     "left_shoulder_pitch_joint":  -1.60,
-    "left_shoulder_roll_joint":    0.25,
+    "left_shoulder_roll_joint":    0.40,
     "left_shoulder_yaw_joint":     0.0,
     "left_elbow_joint":            1.10,
     "left_wrist_roll_joint":       0.0,
     "left_wrist_pitch_joint":      0.0,
     "left_wrist_yaw_joint":        0.0,
     "right_shoulder_pitch_joint": -1.60,
-    "right_shoulder_roll_joint":  -0.25,
+    "right_shoulder_roll_joint":  -0.40,
     "right_shoulder_yaw_joint":    0.0,
     "right_elbow_joint":           1.10,
     "right_wrist_roll_joint":      0.0,
@@ -428,17 +432,21 @@ _CMD_PLACED_BOX_POS  = _CMD_KEY + "placed_box_pos"
 _CMD_PLACED_BOX_QUAT = _CMD_KEY + "placed_box_quat"
 
 
-def _sample_placed_box_pose(env, n, origins, scale, device):
-    """Sample world-frame box pose on the tabletop with the same jitter reset_drop_command_and_object uses for the place target.
-    Args: env: RL env; n: number of envs; origins: (n, 3) env origins; scale: curriculum range multiplier (pinned to 1.0 with the reverse curriculum); device: target device.
+def _sample_placed_box_pose(env, n, origins, scale, device, jitter_mask=None):
+    """Sample world-frame box pose on the tabletop. Jitter can be gated per env via
+    jitter_mask so placed-endpoint envs land deterministically at the box-face anchors
+    while carry-endpoint envs still see the full DR range on the place target.
+    Args: env: RL env; n: number of envs; origins: (n, 3) env origins; scale: curriculum range multiplier (pinned to 1.0); device: target device; jitter_mask: optional (n,) tensor in [0, 1] scaling jitter per env (None -> 1.0 everywhere).
     Returns: (box_pos_w, box_quat_w) tensors shaped (n, 3) and (n, 4).
     """
     from mjlab.utils.lab_api.math import sample_uniform, quat_from_euler_xyz
     zero = torch.zeros(n, device=device)
-    lx = sample_uniform(-PLACE_TARGET_X_HALF * scale, PLACE_TARGET_X_HALF * scale, (n,), device=device) + PLACE_TARGET_X_CENTER
-    ly = sample_uniform(-PLACE_TARGET_Y_HALF * scale, PLACE_TARGET_Y_HALF * scale, (n,), device=device)
+    if jitter_mask is None:
+        jitter_mask = torch.ones(n, device=device)
+    lx = sample_uniform(-PLACE_TARGET_X_HALF * scale, PLACE_TARGET_X_HALF * scale, (n,), device=device) * jitter_mask + PLACE_TARGET_X_CENTER
+    ly = sample_uniform(-PLACE_TARGET_Y_HALF * scale, PLACE_TARGET_Y_HALF * scale, (n,), device=device) * jitter_mask
     box_pos_w = torch.stack([origins[:, 0] + lx, origins[:, 1] + ly, origins[:, 2] + BOX_REST_Z], dim=-1)
-    p_yaw = sample_uniform(-PLACE_YAW_RANGE * scale, PLACE_YAW_RANGE * scale, (n,), device=device)
+    p_yaw = sample_uniform(-PLACE_YAW_RANGE * scale, PLACE_YAW_RANGE * scale, (n,), device=device) * jitter_mask
     box_quat_w = quat_from_euler_xyz(zero, zero, p_yaw)
     return box_pos_w, box_quat_w
 
@@ -481,8 +489,13 @@ def reset_from_carry_buffer(
     carry_joint_pos   = buf["joint_pos"][idx]              # (n, 29) in G1_JOINTS order
     carry_box_pos_by  = buf["box_pos_by"][idx]             # (n, 3), body-yaw frame
     carry_box_quat_by = buf["box_quat_by"][idx]            # (n, 4), body-yaw frame
+    if carry_root_z.dim() == 1:
+        carry_root_z = carry_root_z.unsqueeze(-1)
 
-    # PLACED endpoint (bb=1).
+    # PLACED endpoint (bb=1) targets. Only legs + waist joints are lerped toward PLACED;
+    # arms stay at the carry-buffer values so the hands keep rigidly gripping the box
+    # across all bb. The box descends with the body as the waist pitches forward and the
+    # legs flex, and its final position is read back from the sim after FK settles.
     placed_joint_pos = torch.tensor(
         [PLACED_JOINT_POS[j] for j in asset_cfg.joint_names],
         device=device, dtype=torch.float32,
@@ -494,9 +507,15 @@ def reset_from_carry_buffer(
     placed_quat = torch.tensor(
         PLACED_ROOT_ROT, device=device, dtype=torch.float32,
     ).unsqueeze(0).expand(n, -1).clone()
-    placed_box_pos_w, placed_box_quat_w = _sample_placed_box_pose(env, n, origins, target_scale, device)
 
-    # Stash the placed box pose so reset_drop_command_and_object binds place_target to it (at bb=1 the box endpoint already sits exactly on the target).
+    # Place-target command (same jitter schedule as before: scales with (1 - bb) so bb=1 is
+    # deterministic and bb=0 keeps the full DR range). The box spawn position is derived
+    # below from FK, not from this; only the target command uses it.
+    jitter_scale_scalar = max(0.0, 1.0 - bb)
+    jitter_mask_scalar = torch.full((n,), jitter_scale_scalar, device=device)
+    placed_box_pos_w, placed_box_quat_w = _sample_placed_box_pose(
+        env, n, origins, target_scale, device, jitter_mask=jitter_mask_scalar,
+    )
     if _CMD_PLACED_BOX_POS not in env.extras or env.extras[_CMD_PLACED_BOX_POS].shape[0] != env.num_envs:
         env.extras[_CMD_PLACED_BOX_POS]  = torch.zeros(env.num_envs, 3, device=device)
         env.extras[_CMD_PLACED_BOX_QUAT] = torch.zeros(env.num_envs, 4, device=device)
@@ -504,19 +523,27 @@ def reset_from_carry_buffer(
     env.extras[_CMD_PLACED_BOX_POS][env_ids]  = placed_box_pos_w
     env.extras[_CMD_PLACED_BOX_QUAT][env_ids] = placed_box_quat_w
 
-    # Lerp robot state.
-    joint_pos = bb * placed_joint_pos + (1.0 - bb) * carry_joint_pos
-    root_z    = bb * placed_root_z_val + (1.0 - bb) * carry_root_z
-    root_quat_base = bb * placed_quat + (1.0 - bb) * carry_quat_zy
-    # Lerp of unit quats drifts off the sphere; renormalise so both endpoints stay valid rotations.
+    # Continuous lerp: legs + waist (indices 0-14) go from carry to PLACED, arms (15-28)
+    # stay at the carry-buffer sample so the grip survives the lerp. The box will be
+    # placed between the wrists after FK settles below.
+    N_LEGS_WAIST = 15
+    joint_pos = carry_joint_pos.clone()
+    joint_pos[:, :N_LEGS_WAIST] = (1.0 - bb) * carry_joint_pos[:, :N_LEGS_WAIST] + bb * placed_joint_pos[:, :N_LEGS_WAIST]
+
+    root_z = (1.0 - bb) * carry_root_z + bb * placed_root_z_val
+    # Hemisphere-align carry_quat_zy against placed_quat (identity) before lerping; carry
+    # buffer has ~50% of samples with w<0, which collapses the lerp near bb=0.5 into a
+    # degenerate quaternion and spawns the robot upside-down otherwise.
+    dot = (placed_quat * carry_quat_zy).sum(dim=-1, keepdim=True)
+    carry_quat_aligned = torch.where(dot < 0, -carry_quat_zy, carry_quat_zy)
+    root_quat_base = bb * placed_quat + (1.0 - bb) * carry_quat_aligned
     root_quat_base = root_quat_base / torch.linalg.norm(
         root_quat_base, dim=-1, keepdim=True,
     ).clamp(min=1e-6)
 
-    # Scale additive jitter by (1 - bb) so the placed endpoint spawns deterministically at PLACED_ROOT_POS and the carry endpoint keeps its DR range (matches pick's reset_from_walk_buffer).
-    jitter_scale = 1.0 - bb
-    xy_jitter  = sample_uniform(xy_range[0] * jitter_scale, xy_range[1] * jitter_scale, (n, 2), device=device)
-    yaw_jitter = sample_uniform(yaw_range[0] * jitter_scale, yaw_range[1] * jitter_scale, (n,),   device=device)
+    # Jitter scaled by (1 - bb): bb=1 deterministic, bb=0 full DR.
+    xy_jitter  = sample_uniform(xy_range[0] * jitter_scale_scalar, xy_range[1] * jitter_scale_scalar, (n, 2), device=device)
+    yaw_jitter = sample_uniform(yaw_range[0] * jitter_scale_scalar, yaw_range[1] * jitter_scale_scalar, (n,), device=device)
     zero = torch.zeros_like(yaw_jitter)
     q_yaw = quat_from_euler_xyz(zero, zero, yaw_jitter)
     root_quat_w = quat_mul(q_yaw, root_quat_base)
@@ -524,28 +551,19 @@ def reset_from_carry_buffer(
     robot: Entity = env.scene[asset_cfg.name]
     default_root_state = robot.data.default_root_state[env_ids].clone()
 
-    # Blend root_xy between the walk-default (from default_root_state, plus the +X spawn offset used at bb=0 to line the held box up over the tabletop) and the PLACED absolute offset from the env origin, (1-bb)*(default+offset) + bb*placed keeps both endpoints correct.
+    # Continuous lerp of root_xy between the carry spawn (walk default + spawn offset) and
+    # the PLACED absolute offset.
     carry_root_xy_offset = torch.tensor(
         [ROBOT_SPAWN_X_OFFSET, 0.0], device=device,
     ).unsqueeze(0).expand(n, -1)
-    root_xy = ((1.0 - bb) * (default_root_state[:, 0:2] + carry_root_xy_offset)
-               + bb * placed_root_xy_offset
-               + xy_jitter
-               + origins[:, 0:2])
-    root_z_col = root_z if root_z.dim() == 2 else root_z.unsqueeze(-1)
-    root_z_w = root_z_col + origins[:, 2:3]
+    carry_root_xy_local = default_root_state[:, 0:2] + carry_root_xy_offset
+    root_xy = ((1.0 - bb) * carry_root_xy_local + bb * placed_root_xy_offset
+               + xy_jitter + origins[:, 0:2])
+    root_z_w = root_z + origins[:, 2:3]
     root_pos_w = torch.cat([root_xy, root_z_w], dim=-1)
 
-    # Lerp box state.
-    carry_box_pos_w  = root_pos_w + quat_apply(q_yaw, carry_box_pos_by)
-    carry_box_quat_w = quat_mul(q_yaw, carry_box_quat_by)
-    box_pos_w = bb * placed_box_pos_w + (1.0 - bb) * carry_box_pos_w
-    box_quat_w = bb * placed_box_quat_w + (1.0 - bb) * carry_box_quat_w
-    box_quat_w = box_quat_w / torch.linalg.norm(
-        box_quat_w, dim=-1, keepdim=True,
-    ).clamp(min=1e-6)
-
-    # Physics writes (velocities zeroed on both entities).
+    # Write robot first so sim.forward below propagates the lerped joints and we can read
+    # the resulting hand positions to place the box between them.
     robot.write_root_link_pose_to_sim(
         torch.cat([root_pos_w, root_quat_w], dim=-1), env_ids=env_ids,
     )
@@ -559,6 +577,32 @@ def reset_from_carry_buffer(
         joint_pos, torch.zeros_like(joint_pos),
         env_ids=env_ids, joint_ids=joint_ids,
     )
+
+    # Settle FK so xpos of the wrist links reflects the newly-written joint pose, then
+    # read the wrist positions and place the box between them. Cache the body IDs on
+    # first call; they are static for the model.
+    import mujoco
+    if "_drop_wrist_body_ids" not in env.extras:
+        mj_model = env.sim.mj_model
+        l_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/left_wrist_yaw_link")
+        r_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/right_wrist_yaw_link")
+        env.extras["_drop_wrist_body_ids"] = torch.tensor([l_id, r_id], dtype=torch.long, device=device)
+    wrist_ids = env.extras["_drop_wrist_body_ids"]
+    env.scene.write_data_to_sim()
+    env.sim.forward()
+    xpos = env.sim.data.xpos.data  # (num_envs, nbody, 3)
+    left_wrist_w  = xpos[env_ids, wrist_ids[0], :]
+    right_wrist_w = xpos[env_ids, wrist_ids[1], :]
+    box_pos_w  = 0.5 * (left_wrist_w + right_wrist_w)
+    # Box orientation lerped between carry buffer (rotated by yaw) and placed (identity).
+    carry_box_quat_w = quat_mul(q_yaw, carry_box_quat_by)
+    dot_box = (placed_box_quat_w * carry_box_quat_w).sum(dim=-1, keepdim=True)
+    carry_box_quat_aligned = torch.where(dot_box < 0, -carry_box_quat_w, carry_box_quat_w)
+    box_quat_w = bb * placed_box_quat_w + (1.0 - bb) * carry_box_quat_aligned
+    box_quat_w = box_quat_w / torch.linalg.norm(
+        box_quat_w, dim=-1, keepdim=True,
+    ).clamp(min=1e-6)
+
     box: Entity = env.scene[box_cfg.name]
     box.write_root_link_pose_to_sim(
         torch.cat([box_pos_w, box_quat_w], dim=-1), env_ids=env_ids,
@@ -1946,26 +1990,23 @@ def place_bias_curriculum(env, env_ids):
             env._drop_curriculum_step = 0
         env._drop_curriculum_step += 1
         step = env._drop_curriculum_step
-    # Schedule copied from pick_curriculum (num_steps_per_env=24 -> ~1000 iters hold + ~3000 iters ramp, fits inside the current 4000-iter budget).
-    if step < 24_000:                      # iter 0-1000: pure placed spawn
-        place_bias = 1.0
-    elif step < 96_000:                    # iter 1000-4000: smoothstep 1.0 -> 0.0
-        place_bias = 1.0 - _smoothstep((step - 24_000) / (96_000 - 24_000))
-    else:                                  # iter 4000+: pure carry-buffer spawn
+    # Pure continuous ramp with no hold phase: place_bias smoothsteps from 1.0 at step 0
+    # to 0.0 at step 96_000 (iter 4000 at 24 steps/iter), after which it stays at 0.0.
+    if step < 96_000:
+        place_bias = 1.0 - _smoothstep(step / 96_000)
+    else:
         place_bias = 0.0
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_base")
         term_cfg.params["place_bias"] = place_bias
     except Exception:
         pass
-    # Ramp action_rate_l2 weight on the same schedule as place_bias: keep the base -1e-2 during the PLACED exploration window (step < 24k) so the policy can freely explore release/stand-up motions from the ideal start, then smoothstep down to -2e-2 as place_bias hands the robot carry-buffer samples that require finer control. Mirrors pick_curriculum's ramp.
+    # action_rate_l2 ramps on the same continuous schedule from base -1e-2 to target -2e-2.
     try:
         rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
         base_w, target_w = -1.0e-2, -2.0e-2
-        if step < 24_000:
-            rt_cfg.weight = base_w
-        elif step < 96_000:
-            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep((step - 24_000) / (96_000 - 24_000))
+        if step < 96_000:
+            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep(step / 96_000)
         else:
             rt_cfg.weight = target_w
     except Exception:

@@ -1993,9 +1993,9 @@ def place_bias_curriculum(env, env_ids):
         env._drop_curriculum_step += 1
         step = env._drop_curriculum_step
     # Pure continuous ramp with no hold phase: place_bias smoothsteps from 1.0 at step 0
-    # to 0.0 at step 96_000 (iter 4000 at 24 steps/iter), after which it stays at 0.0.
-    if step < 96_000:
-        place_bias = 1.0 - _smoothstep(step / 96_000)
+    # to 0.0 at step 24_000 (iter 1000 at 24 steps/iter), after which it stays at 0.0.
+    if step < 24_000:
+        place_bias = 1.0 - _smoothstep(step / 24_000)
     else:
         place_bias = 0.0
     try:
@@ -2007,8 +2007,8 @@ def place_bias_curriculum(env, env_ids):
     try:
         rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
         base_w, target_w = -1.0e-2, -2.0e-2
-        if step < 96_000:
-            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep(step / 96_000)
+        if step < 24_000:
+            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep(step / 24_000)
         else:
             rt_cfg.weight = target_w
     except Exception:
@@ -2578,7 +2578,7 @@ def g1_drop_ppo_runner_cfg():
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
-            entropy_coef=0.001,
+            entropy_coef=0.01,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
             gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
             symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,

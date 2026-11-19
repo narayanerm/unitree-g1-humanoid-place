@@ -2403,8 +2403,8 @@ def build_g1_drop_mdp():
                 "yaw_range": ROBOT_SPAWN_YAW_RANGE,
                 "asset_cfg": g1_asset,
                 "box_cfg":   box,
-                # Overwritten every step by place_bias_curriculum; 1.0 = pure placed spawn, 0.0 = pure carry-buffer spawn.
-                "place_bias": 1.0,
+                # Curriculum removed: pin to 0.0 (pure carry-buffer spawn, robot standing with box in grip).
+                "place_bias": 0.0,
                 # Kept at 1.0: the drop_curriculum scale ramp was removed in favour of the reverse curriculum on place_bias, so placed-box jitter always matches reset_drop_command_and_object's full jitter range.
                 "target_scale": 1.0,
             },

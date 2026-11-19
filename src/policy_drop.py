@@ -2497,9 +2497,7 @@ def build_g1_drop_mdp():
         ),
     }
 
-    curriculum = {
-        "reset_stages": CurriculumTermCfg(func=place_bias_curriculum, params={}),
-    }
+    curriculum = {}
 
     return {
         "robot_cfg": robot_cfg,

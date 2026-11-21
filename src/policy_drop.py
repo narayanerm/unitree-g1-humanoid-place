@@ -1290,19 +1290,25 @@ def arm_pose_walk_ready_reward(
     env, box_cfg, left_hand_cfg, right_hand_cfg, arm_cfg,
     target_values: tuple[float, ...] = WALK_READY_ARM_TARGET,
     sigma: float = 0.30,
-    air_margin: float = 0.03,
+    xy_tol: float = 0.05,
+    z_tol: float = 0.03,
     release_dist: float = 0.15,
 ):
-    """Shape the terminal arm pose toward G1_HOME_JOINT_POS so the drop's snapshot feeds cleanly into the walk policy; double-gated on landed and released.
-    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities for the release gate; arm_cfg: SceneEntityCfg selecting the 14 arm joints in HOLDING_ARM_JOINTS order; target_values: per-joint targets aligned with arm_cfg.joint_ids; sigma: Gaussian bandwidth (rad) on the RMS joint error; air_margin: clearance above BOX_REST_Z below which the box counts as landed; release_dist: min hand-to-anchor distance for the release gate.
+    """Shape the terminal arm pose toward G1_HOME_JOINT_POS so the drop's snapshot feeds cleanly into the walk policy; double-gated on box-at-target and hands-released.
+    The gate requires the box to actually sit at the commanded place_target_pos (xy and z within xy_tol / z_tol) rather than only being near BOX_REST_Z. Replaces the previous z-only landed gate, which paid the walk-ready pose as soon as the box dropped to table height anywhere, including after a pelvis push: the policy exploited that by releasing early and nudging the fallen box into place.
+    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities for the release gate; arm_cfg: SceneEntityCfg selecting the 14 arm joints in HOLDING_ARM_JOINTS order; target_values: per-joint targets aligned with arm_cfg.joint_ids; sigma: Gaussian bandwidth (rad) on the RMS joint error; xy_tol: max xy distance from place_target_pos for the at-target gate; z_tol: max |z| distance from place_target_pos for the at-target gate; release_dist: min hand-to-anchor distance for the release gate.
     Returns: (num_envs,) tensor in [0, 1].
     """
-    box_z = _entity_pos(env, box_cfg)[:, 2]
-    landed = (box_z < BOX_REST_Z + air_margin)
+    _ensure_cmd_buffers(env)
+    box_pos = _entity_pos(env, box_cfg)
+    tgt = env.extras[_CMD_KEY + "place_target_pos"]
+    dxy = torch.linalg.norm(box_pos[:, :2] - tgt[:, :2], dim=-1)
+    dz = torch.abs(box_pos[:, 2] - tgt[:, 2])
+    at_target = (dxy < xy_tol) & (dz < z_tol)
     dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
     dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
     released = (dl > release_dist) & (dr > release_dist)
-    gate = (landed & released).float()
+    gate = (at_target & released).float()
 
     robot = env.scene["robot"]
     joints = robot.data.joint_pos[:, arm_cfg.joint_ids]
@@ -1319,19 +1325,25 @@ def legs_waist_pose_walk_ready_reward(
     env, box_cfg, left_hand_cfg, right_hand_cfg, legs_waist_cfg,
     target_values: tuple[float, ...] = WALK_READY_LEGS_WAIST_TARGET,
     sigma: float = 0.30,
-    air_margin: float = 0.03,
+    xy_tol: float = 0.05,
+    z_tol: float = 0.03,
     release_dist: float = 0.15,
 ):
-    """Shape the terminal leg + waist pose toward G1_HOME_JOINT_POS once the box has landed and the hands released, the lower-body twin of arm_pose_walk_ready_reward. Without this the reverse-curriculum PLACED_JOINT_POS (deep squat with waist_pitch=0.90) is the only "goal" the policy sees, so it converges to a thighs-on-table posture even after release.
-    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities for the release gate; legs_waist_cfg: SceneEntityCfg selecting the 15 leg+waist joints in LEGS_WAIST_JOINTS order; target_values: per-joint targets aligned with legs_waist_cfg.joint_ids; sigma: Gaussian bandwidth (rad) on the RMS joint error; air_margin: clearance above BOX_REST_Z below which the box counts as landed; release_dist: min hand-to-anchor distance for the release gate.
+    """Shape the terminal leg + waist pose toward G1_HOME_JOINT_POS once the box is actually placed at the commanded target and the hands have released; the lower-body twin of arm_pose_walk_ready_reward. Without this the reverse-curriculum PLACED_JOINT_POS (deep squat with waist_pitch=0.90) is the only "goal" the policy sees, so it converges to a thighs-on-table posture even after release.
+    Gate switched from z-only (landed near BOX_REST_Z) to 3D at_target (xy and z within xy_tol / z_tol of place_target_pos) so the policy only cashes the walk-ready pose after the box actually reaches the commanded spot, never after a pelvis-push correction.
+    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities for the release gate; legs_waist_cfg: SceneEntityCfg selecting the 15 leg+waist joints in LEGS_WAIST_JOINTS order; target_values: per-joint targets aligned with legs_waist_cfg.joint_ids; sigma: Gaussian bandwidth (rad) on the RMS joint error; xy_tol: max xy distance from place_target_pos for the at-target gate; z_tol: max |z| distance from place_target_pos for the at-target gate; release_dist: min hand-to-anchor distance for the release gate.
     Returns: (num_envs,) tensor in [0, 1].
     """
-    box_z = _entity_pos(env, box_cfg)[:, 2]
-    landed = (box_z < BOX_REST_Z + air_margin)
+    _ensure_cmd_buffers(env)
+    box_pos = _entity_pos(env, box_cfg)
+    tgt = env.extras[_CMD_KEY + "place_target_pos"]
+    dxy = torch.linalg.norm(box_pos[:, :2] - tgt[:, :2], dim=-1)
+    dz = torch.abs(box_pos[:, 2] - tgt[:, 2])
+    at_target = (dxy < xy_tol) & (dz < z_tol)
     dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
     dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
     released = (dl > release_dist) & (dr > release_dist)
-    gate = (landed & released).float()
+    gate = (at_target & released).float()
 
     robot = env.scene["robot"]
     joints = robot.data.joint_pos[:, legs_waist_cfg.joint_ids]
@@ -2225,14 +2237,14 @@ def build_g1_drop_mdp():
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "arm_cfg": arm_asset,
                     "target_values": WALK_READY_ARM_TARGET,
-                    "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
+                    "sigma": 0.30, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
         ),
         "legs_waist_pose_walk_ready": RewardTermCfg(
             func=legs_waist_pose_walk_ready_reward, weight=2.0,
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "legs_waist_cfg": legs_waist_asset,
                     "target_values": WALK_READY_LEGS_WAIST_TARGET,
-                    "sigma": 0.30, "air_margin": 0.03, "release_dist": 0.15},
+                    "sigma": 0.30, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
         ),
         # Robot-side stability: torso upright + pelvis upright + feet on ground.
         "stability": RewardTermCfg(
@@ -2362,7 +2374,7 @@ def build_g1_drop_mdp():
         "body_touched_box": TerminationTermCfg(
             func=body_touched_box,
             params={"sensor_name": body_box_contact_cfg.name,
-                    "force_threshold": 5.0},
+                    "force_threshold": 4.0},
         ),
     }
 

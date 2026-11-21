@@ -2217,30 +2217,31 @@ def build_g1_drop_mdp():
     }
 
     rewards = {
-        # Single positive signal for the box side: dense isotropic Gaussian on the 3D distance between box and commanded place target. Ungated across the whole episode so the gradient points toward the target from every state (held high, descending, resting on the tabletop).
+        # Trajectory-aware box-side signal: additive xy + z Gaussians with the asymmetric z kernel (broad above the target, narrow below). The additive structure pays each axis independently so the policy earns reward for xy alignment while still airborne and for z descent once aligned, instead of the isotropic form that rewards the Pythagorean diagonal (drop in a straight line from release height to target). The narrow sigma_z_below punishes overshooting past the tabletop.
         "box_at_target_pos": RewardTermCfg(
-            func=box_at_target_simple_reward, weight=6.0,
-            params={"box_cfg": box, "sigma_xy": 0.10, "sigma_z": 0.10},
+            func=box_at_place_target_pos_reward, weight=6.0,
+            params={"box_cfg": box,
+                    "sigma_xy": 0.15, "sigma_z_above": 0.20, "sigma_z_below": 0.05},
         ),
         # Keep box upright: ungated reward on box up_z. Small weight, only to prevent the policy from solving the Gaussian by tipping the box.
         "box_upright": RewardTermCfg(
             func=box_upright_reward, weight=1.0, params={"box_cfg": box},
         ),
-        # Single velocity penalty on the box: ungated |v|^2 + 0.1 |omega|^2 along the whole episode. Replaces box_impact_vel (gated) and the free-fall term from box_unsupported. Together with box_below_table termination, teaches "keep the box slow and on the table" without naming the hands.
+        # Single velocity penalty on the box: ungated |v|^2 + 0.1 |omega|^2 along the whole episode. Weight raised to -3.0 to discourage the fingertip-nudge after release (box velocity spikes briefly during a nudge).
         "box_vel_penalty": RewardTermCfg(
-            func=box_vel_penalty, weight=-2.0,
+            func=box_vel_penalty, weight=-3.0,
             params={"box_cfg": box, "w_lin": 1.0, "w_ang": 0.1},
         ),
-        # Terminal pose handoff for the walk policy. Double-gated on (box landed AND both hands released); stays silent during descent. Kept because they shape the snapshot that the FSM/handoff consumes, independent of the box-side simplification.
+        # Terminal pose handoff for the walk policy. Double-gated on (box at target AND both hands released); stays silent during descent. Weights raised so once the gate opens the pull toward the home pose outweighs the temptation to drift into a tilted-back parking posture.
         "arm_pose_walk_ready": RewardTermCfg(
-            func=arm_pose_walk_ready_reward, weight=1.5,
+            func=arm_pose_walk_ready_reward, weight=2.5,
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "arm_cfg": arm_asset,
                     "target_values": WALK_READY_ARM_TARGET,
                     "sigma": 0.30, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
         ),
         "legs_waist_pose_walk_ready": RewardTermCfg(
-            func=legs_waist_pose_walk_ready_reward, weight=2.0,
+            func=legs_waist_pose_walk_ready_reward, weight=3.5,
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "legs_waist_cfg": legs_waist_asset,
                     "target_values": WALK_READY_LEGS_WAIST_TARGET,
@@ -2277,7 +2278,7 @@ def build_g1_drop_mdp():
                     "left_hip_cfg": left_hip, "right_hip_cfg": right_hip,
                     "left_hand_cfg": left_hand, "right_hand_cfg": right_hand, "box_cfg": box,
                     "edge_xy_threshold": 0.08, "edge_z_threshold": 0.08,
-                    "w_non_hand_box": -6.0, "w_body_table": -2.0,
+                    "w_non_hand_box": -3.0, "w_body_table": -2.0,
                     "w_body_table_edge": -3.0},
         ),
     }

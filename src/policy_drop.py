@@ -1704,6 +1704,22 @@ def free_fall_penalty(env, box_cfg, left_hand_cfg, right_hand_cfg,
     return falling * unsupported * (-vz)
 
 
+def box_in_free_fall(env, box_cfg, left_hand_cfg, right_hand_cfg,
+                     vel_threshold: float = 0.50,
+                     hand_far_dist: float = 0.15):
+    """Termination when the box descends faster than vel_threshold while both hands are more than hand_far_dist from their grasp anchors. Kills the release-in-air exploits that transit the at_target gate volume during a free fall by ending the episode before the walk_ready reward can accumulate. Controlled lowering stays well under vel_threshold with hands tracking the grasp anchors.
+    Args: env: RL env; box_cfg: box entity; left/right_hand_cfg: hand entities; vel_threshold: downward speed above which the box counts as falling (m/s); hand_far_dist: hand-to-anchor distance above which the hand counts as not supporting the box (m).
+    Returns: (num_envs,) bool tensor of termination flags.
+    """
+    v = env.scene[box_cfg.name].data.root_link_lin_vel_w
+    vz = torch.nan_to_num(v[:, 2], nan=0.0, posinf=0.0, neginf=0.0).clamp(-5.0, 5.0)
+    falling = vz < -vel_threshold
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    unsupported = torch.minimum(dl, dr) > hand_far_dist
+    return falling & unsupported
+
+
 def box_at_place_target_quat_reward(env, box_cfg):
     """SO(3) similarity |q_box . q_target|^2, invariant to quaternion double cover.
     Args: env: the RL env; box_cfg: box entity.
@@ -2238,14 +2254,14 @@ def build_g1_drop_mdp():
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "arm_cfg": arm_asset,
                     "target_values": WALK_READY_ARM_TARGET,
-                    "sigma": 0.30, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
+                    "sigma": 0.10, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
         ),
         "legs_waist_pose_walk_ready": RewardTermCfg(
             func=legs_waist_pose_walk_ready_reward, weight=3.5,
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "legs_waist_cfg": legs_waist_asset,
                     "target_values": WALK_READY_LEGS_WAIST_TARGET,
-                    "sigma": 0.30, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
+                    "sigma": 0.10, "xy_tol": 0.05, "z_tol": 0.03, "release_dist": 0.15},
         ),
         # Robot-side stability: torso upright + pelvis upright + feet on ground.
         "stability": RewardTermCfg(
@@ -2376,6 +2392,12 @@ def build_g1_drop_mdp():
             func=body_touched_box,
             params={"sensor_name": body_box_contact_cfg.name,
                     "force_threshold": 4.0},
+        ),
+        # Kill the release-in-air exploit: if the box is descending faster than vel_threshold while the hands are far from the grasp anchors, the box is in free fall, end the episode before the at_target gate can briefly open on the box transiting through the target volume. Controlled lowering stays under the threshold with hands tracking the anchors.
+        "box_free_fall": TerminationTermCfg(
+            func=box_in_free_fall,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "vel_threshold": 0.50, "hand_far_dist": 0.15},
         ),
     }
 
